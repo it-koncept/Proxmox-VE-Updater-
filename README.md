@@ -52,11 +52,13 @@ yum install qemu-guest-agent
 | `windows` | Skips the VM/CT entirely (no updates run)|
 
 ### CLI Examples
-\`\`\`bash
-pct set 201 --tags apt
-qm set 101 --tags yum
-qm set 150 --tags windows
-\`\`\`
+
+\`\`\`bash pct set 201 --tags apt\`\`\`
+
+\`\`\`bash qm set 101 --tags yum\`\`\`
+
+\`\`\`bash qm set 150 --tags windows\`\`\`
+
 
 ---
 
