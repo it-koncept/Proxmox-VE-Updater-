@@ -81,14 +81,17 @@ Add this line:
 
 ## 📊 Example Output
 
-\`\`\`
+
 ▶ Processing 101 (qemu) with tags: apt
    → qm apt update/upgrade
+   
 ▶ Processing 201 (lxc) with tags: yum
    → pct yum update
+   
 🟦 Skipping 150 (qemu) - tag: windows
+
 ⚪ Skipping 202 (lxc) - status stopped
-\`\`\`
+
 
 ---
 
