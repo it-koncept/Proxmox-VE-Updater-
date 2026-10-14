@@ -1,0 +1,12 @@
+#!/bin/bash
+cat << 'JSON'
+[
+ {"vmid":101,"type":"qemu","status":"running","tags":"apt","node":"testnode","description":"My mail server with spaces in description"},
+ {"vmid":102,"type":"lxc","status":"running","tags":"compat;other","node":"testnode"},
+ {"vmid":103,"type":"qemu","status":"running","tags":"windows","node":"testnode"},
+ {"vmid":104,"type":"lxc","status":"stopped","tags":"apt","node":"testnode"},
+ {"vmid":105,"type":"lxc","status":"running","tags":"YUM","node":"testnode"},
+ {"vmid":106,"type":"lxc","status":"running","node":"testnode"},
+ {"vmid":"garbage","type":"lxc","status":"running","tags":"apt","node":"testnode"}
+]
+JSON

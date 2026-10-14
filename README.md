@@ -1,118 +1,158 @@
-# 🖥️ Proxmox VM/CT Auto-Update Script
+# 🖥️ Proxmox VE Updater
 
-This repository contains a Bash script that automatically updates **LXC containers** and **QEMU virtual machines** on a Proxmox VE host.  
-It uses Proxmox **tags** to determine which package manager to run (`apt` or `yum`) and can skip systems such as Windows VMs.
+Bash script that updates **LXC containers** and **QEMU virtual machines** on a Proxmox VE host.
+It uses Proxmox **tags** to decide which package manager to run and skips e.g. Windows VMs.
 
 ---
 
 ## ✨ Features
 
-- Updates both **LXC containers** (`pct exec`) and **QEMU VMs** (`qm guest exec`).
-- Runs the correct package manager based on **Proxmox tags**:
-  - `apt` → Debian/Ubuntu systems
-  - `yum` → CentOS/RHEL systems
-  - `windows` → Skips updates
-- Processes **only running** guests.
-- Easy to extend and automate via cron.
+- Updates **LXC containers** (`pct exec`) and **QEMU VMs** (`qm guest exec`) on the local node.
+- Package manager chosen by **exact tag match** (tags are `;`-separated in PVE):
+  - `apt` → `apt-get update && upgrade` (noninteractive, keeps existing conffiles)
+  - `yum` → `dnf -y update` if the guest has dnf, otherwise `yum -y update`
+  - `windows` → skipped entirely
+- Only touches **running** guests.
+- Single-instance guard (`flock`) — safe if a cron run overlaps the previous one.
+- Per-guest exit codes, timestamped log lines, end summary, non-zero exit code on failures.
+- `--dry-run` mode to preview what would happen.
 
 ---
 
 ## ⚙️ Requirements
 
 ### On the Proxmox host
-- Install `jq`:
-\`\`\`bash
+Install `jq`:
+
+```bash
 apt install -y jq
-\`\`\`
+```
 
 ### For QEMU VMs
-- Install **QEMU Guest Agent** inside the VM:
+Install **QEMU Guest Agent** inside the VM:
 
 Debian/Ubuntu:
-\`\`\`bash
+
+```bash
 apt install qemu-guest-agent
-\`\`\`
+```
 
-CentOS/RHEL:
-\`\`\`bash
-yum install qemu-guest-agent
-\`\`\`
+CentOS/RHEL/Fedora:
 
-- Enable the Guest Agent in Proxmox GUI:  
-  **VM → Options → QEMU Guest Agent → Enabled**
+```bash
+dnf install qemu-guest-agent
+```
+
+Enable the Guest Agent in Proxmox:
+**VM → Options → QEMU Guest Agent → Enabled**
+
+(Without it, `qm guest exec` fails with "No QEMU guest agent configured" — v1 of this
+script hid that because it never checked exit codes.)
 
 ---
 
 ## 🏷️ Using Tags
 
-| Tag       | Action                                    |
-|-----------|-------------------------------------------|
-| `apt`     | Runs \`apt update && apt upgrade\`         |
-| `yum`     | Runs \`yum update\`                        |
-| `windows` | Skips the VM/CT entirely (no updates run)|
+Tag matching is **exact** (case-insensitive) per `;`-separated tag — a tag like
+`compat` does **not** match `apt`.
 
-### CLI Examples
+| Tag       | Action                                     |
+|-----------|--------------------------------------------|
+| `apt`     | `apt-get update && apt-get upgrade`        |
+| `yum`     | `dnf -y update` (falls back to `yum`)      |
+| `windows` | Skips the VM/CT entirely (no updates run)  |
 
-\`\`\`bash pct set 201 --tags apt\`\`\`
+CLI examples:
 
-\`\`\`bash qm set 101 --tags yum\`\`\`
-
-\`\`\`bash qm set 150 --tags windows\`\`\`
-
+```bash
+pct set 201 --tags apt
+qm set 101 --tags yum
+qm set 150 --tags windows
+```
 
 ---
 
 ## 🚀 Usage
 
+Preview first (recommended):
+
+```bash
+./update-vms.sh --dry-run
+```
+
 Run manually:
-\`\`\`bash
-./scripts/update-vms.sh
-\`\`\`
 
-Schedule with cron (e.g., every night at 3 AM):
-\`\`\`bash
+```bash
+./update-vms.sh
+```
+
+Schedule with cron (e.g. every night at 3 AM):
+
+```bash
 crontab -e
-\`\`\`
+```
 
-Add this line:
-\`\`\`bash
-0 3 * * * /root/proxmox-vm-update/scripts/update-vms.sh >> /var/log/update-vms.log 2>&1
-\`\`\`
+```cron
+0 3 * * * /root/update-vms.sh >> /var/log/update-vms.log 2>&1
+```
+
+### Options / environment
+
+| Setting             | Default   | Meaning                                   |
+|---------------------|-----------|-------------------------------------------|
+| `--dry-run`         | off       | Print what would run, change nothing      |
+| `PVE_NODE`          | hostname  | Only update guests on this node           |
+| `QEMU_EXEC_TIMEOUT` | 1800      | `qm guest exec --timeout` in seconds      |
+
+> **Why the timeout matters:** `qm guest exec` defaults to **30 seconds**, which kills
+> long package installs mid-run and can leave dpkg/rpm in a broken state. This script
+> raises it to 30 minutes by default.
 
 ---
 
 ## 📊 Example Output
 
-
-▶ Processing 101 (qemu) with tags: apt
-   → qm apt update/upgrade
-   
-▶ Processing 201 (lxc) with tags: yum
-   → pct yum update
-   
-🟦 Skipping 150 (qemu) - tag: windows
-
-⚪ Skipping 202 (lxc) - status stopped
-
+```
+[2026-10-15 03:00:01] === update-vms start (node=prod-node) ===
+[2026-10-15 03:00:02] ▶ Updating 107 (lxc) [apt]
+[2026-10-15 03:01:10] ▶ Updating 101 (qemu) [yum/dnf]
+[2026-10-15 03:01:45]    ✗ failed (rc=1):
+     | Error: QEMU guest agent is not running
+[2026-10-15 03:01:45] 🟦 Skipping 150 (qemu) - tag: windows
+[2026-10-15 03:01:45] ⚪ Skipping 149 (lxc) - status stopped
+[2026-10-15 03:01:45] === done: 2 updated, 1 failed, 2 skipped ===
+```
 
 ---
 
 ## 🛠️ Troubleshooting
 
-- **\`qm guest exec\` fails** → Ensure QEMU Guest Agent is installed inside the VM and enabled in Proxmox.  
-- **Tags not applied** → Verify VM/CT has correct tags:
-\`\`\`bash
+- **`qm guest exec` fails** → Ensure QEMU Guest Agent is installed inside the VM *and* enabled in Proxmox.
+- **Tags not applied** → Verify:
+
+```bash
 qm config <VMID> | grep tags
 pct config <CTID> | grep tags
-\`\`\`
-- **Containers update but VMs don’t** → Most likely missing guest agent or permissions.  
+```
+
+- **Containers update but VMs don't** → Missing guest agent or the agent timeout is hit.
+- **"Another update-vms run is already in progress"** → A previous run is still going (flock guard); wait for it or check `ps aux | grep update-vms`.
+
+---
+
+## 🔒 Security notes
+
+- Runs as root on the host; executes only fixed, hardcoded package-manager commands inside guests — tags select *which* guests and *which* command, never arbitrary input.
+- VMIDs are validated as numeric before any `pct`/`qm` call.
+- The node name is passed to `jq` via `--arg`, never interpolated into the filter.
+- No credentials, no network access; everything stays on the host.
 
 ---
 
 ## 📄 License & Disclaimer
 
-MIT License – feel free to use and modify.  
+MIT License (see [LICENSE](LICENSE)).
 
-**Disclaimer:**  
-Proxmox® is a registered trademark of **Proxmox Server Solutions GmbH**.  
-I am not a member of Proxmox Server Solutions GmbH. This is **not** an official program from Proxmox!
+**Disclaimer:**
+Proxmox® is a registered trademark of **Proxmox Server Solutions GmbH**.
+This is **not** an official program from Proxmox Server Solutions GmbH.
