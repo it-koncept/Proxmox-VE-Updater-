@@ -80,6 +80,21 @@ Preview first (recommended):
 ./update-vms.sh --dry-run
 ```
 
+Inspect (read-only, `--list` works as non-root):
+
+```bash
+./update-vms.sh --list            # all guests on this node + planned action
+./update-vms.sh --check           # preflight + inventory summary (root)
+```
+
+Target specific guests (v3.1):
+
+```bash
+./update-vms.sh --only 107,141            # only these VMIDs
+./update-vms.sh --exclude 150             # skip these VMIDs
+./update-vms.sh --dry-run --only 107      # filters combine with dry-run
+```
+
 Run manually:
 
 ```bash

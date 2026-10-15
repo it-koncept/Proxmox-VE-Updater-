@@ -1,5 +1,13 @@
 # Changelog
 
+## v3.1 (CLI, Fase B B4)
+- **New:** `--version` prints the version (now `3.1.0`).
+- **New:** `--list` — read-only table of node guests with planned action per guest (`apt`/`yum`/`windows`/`stopped`/`no-tag`/`excluded`/`not-targeted`/`malformed`); works as non-root; takes no lock.
+- **New:** `--check` — runs the full preflight (root included) and prints an inventory summary by action; makes no changes.
+- **New:** `--only <ids>` / `--exclude <ids>` (comma-separated, numeric; `FR-008`). Values are validated as VMID lists before use — injection-style values are rejected (exit 2). `--only` VMIDs not found on the node produce a typo warning. Filters combine with `--dry-run`/`--list`/`--check`.
+- **Tests:** 12 new cases (31 total, all passing): version, list, check (root + non-root), only/exclude filtering, invalid-list rejection, unknown-VMID warning, dry-run+filter, list classification, check with pvesh failure, missing flag value.
+- Verified live on prod-node with read-only flags only (`--version`, `--list`, `--check`, `--dry-run --only`); no production changes.
+
 ## v3 (hardening, Fase B B1–B3)
 - **Fix (critical):** `pvesh` failure or non-JSON output is now a hard error (exit 2). v2 silently reported `0 updated, 0 failed` **success** when pvesh failed or output was corrupt.
 - **Fix:** `pct exec` now bounded by `timeout` (`PCT_EXEC_TIMEOUT`, default 1800 s). v2 only bounded `qm guest exec`. Note: the timeout bounds the pct client; a killed client does not necessarily stop the package command already running inside the container.

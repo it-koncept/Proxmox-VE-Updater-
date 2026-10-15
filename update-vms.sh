@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Proxmox VE guest auto-update (v3)
+# Proxmox VE guest auto-update (v3.1)
 #
 # Updates running LXC containers and QEMU VMs on the local node based on
 # Proxmox tags (tags are ';' separated in PVE, matched EXACTLY):
@@ -8,8 +8,16 @@
 #   yum     -> dnf -y update if present, else yum -y update
 #   windows -> skipped
 #
+# v3.1 (B4) adds CLI surface (FR-008, SEC-007):
+#   --version          print version and exit
+#   --list             list node guests + planned action (read-only, non-root ok)
+#   --check            preflight + inventory summary, no changes (root required)
+#   --only <ids>       only these VMIDs (comma-separated, numeric)
+#   --exclude <ids>    skip these VMIDs (comma-separated, numeric)
+#   --only/--exclude combine with --dry-run/--list/--check.
+#
 # v3 hardening over v2 (see docs/CURRENT_STATE.md and tests/):
-#   - preflight: root check (dry-run exempt), required binaries, numeric
+#   - preflight: root check (dry-run/list exempt), required binaries, numeric
 #     timeout validation - all before any guest is touched
 #   - pvesh failure or non-JSON output is a HARD ERROR (exit 2); v2 silently
 #     reported "0 updated" success when pvesh failed or jq output was broken
@@ -32,7 +40,8 @@
 #   - per-guest exit codes, summary, non-zero exit if anything failed
 #   - --dry-run flag
 #
-# Usage: ./update-vms.sh [--dry-run]
+# Usage: ./update-vms.sh [--dry-run] [--list] [--check] [--version]
+#                        [--only <vmid,vmid>] [--exclude <vmid,vmid>]
 # Env:   PVE_NODE=<name>          override node (default: hostname)
 #        QEMU_EXEC_TIMEOUT=<sec>  qm guest exec timeout (default: 1800)
 #        PCT_EXEC_TIMEOUT=<sec>   pct exec wrapper timeout (default: 1800)
@@ -40,6 +49,7 @@
 #
 set -u -o pipefail
 
+VERSION="3.1.0"
 EXIT_OK=0
 EXIT_GUEST_FAILURE=1
 EXIT_PREFLIGHT=2
@@ -50,25 +60,78 @@ NODE="${PVE_NODE:-$(hostname)}"
 QEMU_EXEC_TIMEOUT="${QEMU_EXEC_TIMEOUT:-1800}"
 PCT_EXEC_TIMEOUT="${PCT_EXEC_TIMEOUT:-1800}"
 DRY_RUN=0
+LIST=0
+CHECK=0
+ONLY=""
+EXCLUDE=""
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
 usage() {
-    echo "usage: $(basename "$0") [--dry-run]" >&2
-    echo "  --dry-run   preview actions without changing anything" >&2
+    cat >&2 <<EOF
+usage: $(basename "$0") [options]
+  (no options)     update apt/yum-tagged running guests on this node
+  --dry-run        preview actions without changing anything (non-root ok)
+  --list           list guests on this node with planned action (non-root ok)
+  --check          run preflight + inventory summary, no changes (root required)
+  --version        print version and exit
+  --only <ids>     only these VMIDs (comma-separated, numeric)
+  --exclude <ids>  skip these VMIDs (comma-separated, numeric)
+  -h, --help       this help
+exit codes: 0 ok | 1 guest failure(s) | 2 preflight/usage | 3 lock busy
+EOF
 }
 
 # ---- argument parsing (unknown args are rejected, SEC-007) ---------------
-for arg in "$@"; do
-    case "$arg" in
+require_value() {
+    # require_value <flag-name> <remaining-argc>
+    if [ "$2" -lt 2 ]; then
+        echo "error: $1 requires a value" >&2
+        usage
+        exit "$EXIT_PREFLIGHT"
+    fi
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
         --dry-run) DRY_RUN=1 ;;
+        --list)    LIST=1 ;;
+        --check)   CHECK=1 ;;
+        --version) echo "update-vms $VERSION"; exit "$EXIT_OK" ;;
+        --only)
+            require_value --only $#; ONLY="$2"; shift ;;
+        --only=*)    ONLY="${1#--only=}" ;;
+        --exclude)
+            require_value --exclude $#; EXCLUDE="$2"; shift ;;
+        --exclude=*) EXCLUDE="${1#--exclude=}" ;;
         -h|--help) usage; exit "$EXIT_OK" ;;
-        *) echo "error: unknown argument: $arg" >&2; usage; exit "$EXIT_PREFLIGHT" ;;
+        *) echo "error: unknown argument: $1" >&2; usage; exit "$EXIT_PREFLIGHT" ;;
     esac
+    shift
 done
 
 # ---- preflight (SEC-005/007/008): validate before touching anything ------
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+in_list() { printf '%s' ",$1," | grep -q ",$2,"; }
+
+# Validate a comma-separated VMID list (SEC-007); exits 2 on any bad entry.
+# An empty list means "no filter" and is valid.
+validate_id_list() {
+    local list="$1" name="$2" item
+    [ -z "$list" ] && return 0
+    local IFS=','
+    local -a items
+    read -ra items <<< "$list"
+    for item in "${items[@]}"; do
+        item="${item//[[:space:]]/}"
+        if ! is_uint "$item"; then
+            log "preflight: $name: invalid VMID '$item' (numeric, comma-separated)"
+            exit "$EXIT_PREFLIGHT"
+        fi
+    done
+}
+validate_id_list "$ONLY" --only
+validate_id_list "$EXCLUDE" --exclude
 
 if ! is_uint "$QEMU_EXEC_TIMEOUT"; then
     log "preflight: QEMU_EXEC_TIMEOUT must be a non-negative integer (got: $QEMU_EXEC_TIMEOUT)"
@@ -86,18 +149,11 @@ for bin in jq pvesh pct qm flock timeout; do
     fi
 done
 
-if [ "$(id -u)" -ne 0 ] && [ "$DRY_RUN" -ne 1 ]; then
-    log "preflight: root is required for real runs (use --dry-run as non-root)"
+# --list is read-only and allowed as non-root; --check must verify the real
+# root prerequisite, so it is NOT exempt.
+if [ "$(id -u)" -ne 0 ] && [ "$DRY_RUN" -ne 1 ] && [ "$LIST" -ne 1 ]; then
+    log "preflight: root is required for real runs (use --dry-run or --list as non-root)"
     exit "$EXIT_PREFLIGHT"
-fi
-
-if ! { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
-    log "preflight: cannot open lock file: $LOCK_FILE"
-    exit "$EXIT_PREFLIGHT"
-fi
-if ! flock -n 9; then
-    log "Another update-vms run is already in progress - exiting."
-    exit "$EXIT_LOCK"
 fi
 
 # Exact match of a tag in a ';'-separated PVE tag list (case-insensitive).
@@ -110,6 +166,19 @@ has_tag() {
         [ "${t,,}" = "$want" ] && return 0
     done
     return 1
+}
+
+# Classify one guest -> planned action word (shared by list/check reporting).
+guest_action() {
+    local vmid="$1" status="$2" tags="$3"
+    if ! is_uint "$vmid"; then echo "malformed"; return; fi
+    if [ -n "$ONLY" ] && ! in_list "$ONLY" "$vmid"; then echo "not-targeted"; return; fi
+    if [ -n "$EXCLUDE" ] && in_list "$EXCLUDE" "$vmid"; then echo "excluded"; return; fi
+    if [ "$status" != "running" ]; then echo "stopped"; return; fi
+    if has_tag "$tags" "windows"; then echo "windows"; return; fi
+    if has_tag "$tags" "yum"; then echo "yum"; return; fi
+    if has_tag "$tags" "apt"; then echo "apt"; return; fi
+    echo "no-tag"
 }
 
 OK=0; FAIL=0; SKIP=0
@@ -161,6 +230,45 @@ fi
 total_count=$(printf '%s' "$resources" | jq 'length')
 node_guest_count=$(printf '%s' "$resources" | jq --arg node "$NODE" '[.[] | select(.node == $node)] | length')
 
+# ---- read-only modes: --list / --check (no lock, no changes) -------------
+if [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ]; then
+    [ "$CHECK" -eq 1 ] && MODE=", check" || MODE=", list"
+    log "=== update-vms start (node=$NODE$MODE) ==="
+    if [ "$node_guest_count" -eq 0 ]; then
+        log "⚠ no guests found on node $NODE (fetched $total_count total) - check PVE_NODE"
+    fi
+    declare -A ACTION_COUNT=()
+    while IFS= read -r VM; do
+        VMID=$(printf '%s' "$VM" | jq -r '.vmid')
+        TYPE=$(printf '%s' "$VM" | jq -r '.type')
+        STATUS=$(printf '%s' "$VM" | jq -r '.status')
+        TAGS=$(printf '%s' "$VM" | jq -r '.tags // ""')
+        NAME=$(printf '%s' "$VM" | jq -r '.name // ""')
+        ACTION=$(guest_action "$VMID" "$STATUS" "$TAGS")
+        ACTION_COUNT[$ACTION]=$(( ${ACTION_COUNT[$ACTION]:-0} + 1 ))
+        if [ "$LIST" -eq 1 ]; then
+            printf '%-8s %-5s %-8s %-24s %s\n' "$VMID" "$TYPE" "$STATUS" "${TAGS:--}" "$NAME [$ACTION]"
+        fi
+    done < <(printf '%s' "$resources" | jq -c --arg node "$NODE" '.[] | select(.node == $node)')
+    if [ "$CHECK" -eq 1 ]; then
+        for action in "${!ACTION_COUNT[@]}"; do
+            log "  inventory: $action = ${ACTION_COUNT[$action]}"
+        done
+        log "preflight ok: root, binaries, env, inventory"
+    fi
+    exit "$EXIT_OK"
+fi
+
+# ---- update / dry-run path: lock before touching anything ----------------
+if ! { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
+    log "preflight: cannot open lock file: $LOCK_FILE"
+    exit "$EXIT_PREFLIGHT"
+fi
+if ! flock -n 9; then
+    log "Another update-vms run is already in progress - exiting."
+    exit "$EXIT_LOCK"
+fi
+
 MODE=""
 [ "$DRY_RUN" -eq 1 ] && MODE=", dry-run"
 log "=== update-vms start (node=$NODE$MODE) ==="
@@ -169,6 +277,7 @@ if [ "$node_guest_count" -eq 0 ]; then
     log "⚠ no guests found on node $NODE (fetched $total_count total) - check PVE_NODE"
 fi
 
+ONLY_FOUND=","
 while IFS= read -r VM; do
     VMID=$(printf '%s' "$VM" | jq -r '.vmid')
     TYPE=$(printf '%s' "$VM" | jq -r '.type')
@@ -179,6 +288,16 @@ while IFS= read -r VM; do
         log "⚠ Skipping malformed entry (vmid=$VMID)"
         SKIP=$((SKIP+1)); continue
     fi
+
+    if [ -n "$ONLY" ] && ! in_list "$ONLY" "$VMID"; then
+        log "⏭ Skipping $VMID ($TYPE) - not in --only list"
+        SKIP=$((SKIP+1)); continue
+    fi
+    if [ -n "$EXCLUDE" ] && in_list "$EXCLUDE" "$VMID"; then
+        log "⏭ Skipping $VMID ($TYPE) - in --exclude list"
+        SKIP=$((SKIP+1)); continue
+    fi
+    ONLY_FOUND="$ONLY_FOUND$VMID,"
 
     if [ "$STATUS" != "running" ]; then
         log "⚪ Skipping $VMID ($TYPE) - status $STATUS"
@@ -210,6 +329,17 @@ while IFS= read -r VM; do
         SKIP=$((SKIP+1))
     fi
 done < <(printf '%s' "$resources" | jq -c --arg node "$NODE" '.[] | select(.node == $node)')
+
+# Warn about --only VMIDs that do not exist on this node (typo catcher).
+if [ -n "$ONLY" ]; then
+    IFS=',' read -ra only_items <<< "$ONLY"
+    for want in "${only_items[@]}"; do
+        want="${want//[[:space:]]/}"
+        if ! in_list "$ONLY_FOUND" "$want"; then
+            log "⚠ --only: VMID $want not found on node $NODE (typo?)"
+        fi
+    done
+fi
 
 log "=== done: $OK updated, $FAIL failed, $SKIP skipped ==="
 if [ "$FAIL" -gt 0 ]; then

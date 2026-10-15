@@ -228,6 +228,109 @@ test_wrong_node_warns() {
     assert_calls_not "pct exec"
 }
 
+# 20. --version prints the version and exits 0.
+test_version() {
+    run_script --version
+    assert_rc 0
+    assert_log "update-vms 3."
+}
+
+# 21. --list shows guests incl. stopped ones, works as non-root, no exec calls.
+test_list_mode() {
+    unset MOCK_ID_UID
+    run_script --list
+    assert_rc 0
+    assert_log "107"
+    assert_log "[apt]"
+    assert_log "[stopped]"
+    assert_log "[windows]"
+    assert_calls_not "pct exec"
+    assert_calls_not "qm guest exec"
+}
+
+# 22. --check reports inventory summary and preflight ok, no exec calls.
+test_check_mode() {
+    run_script --check
+    assert_rc 0
+    assert_log "preflight ok"
+    assert_log "inventory: apt = 2"
+    assert_calls_not "pct exec"
+}
+
+# 23. --check as non-root must FAIL (it verifies the root prerequisite).
+test_check_requires_root() {
+    unset MOCK_ID_UID
+    run_script --check
+    assert_rc 2
+    assert_log "root is required"
+}
+
+# 24. --only restricts updates to the named VMIDs.
+test_only_filter() {
+    run_script --only 107
+    assert_rc 0
+    assert_calls "pct exec 107"
+    assert_calls_not "pct exec 111"
+    assert_calls_not "qm guest exec 102"
+    assert_log "not in --only list"
+    assert_log "1 updated, 0 failed"
+}
+
+# 25. --exclude removes named VMIDs from the run.
+test_exclude_filter() {
+    run_script --exclude 107
+    assert_rc 0
+    assert_calls_not "pct exec 107"
+    assert_calls "pct exec 111"
+}
+
+# 26. Injection attempts in --only must be rejected (SEC-007).
+test_only_invalid_ids_rejected() {
+    run_script --only "107; rm -rf /"
+    assert_rc 2
+    assert_log "invalid VMID"
+    assert_calls_not "pct exec"
+}
+
+# 27. --only with a VMID that does not exist warns about a typo.
+test_only_unknown_vmid_warns() {
+    run_script --only 99999
+    assert_rc 0
+    assert_log "VMID 99999 not found on node"
+    assert_calls_not "pct exec"
+}
+
+# 28. --only combines with --dry-run: preview only the selected guest.
+test_only_with_dry_run() {
+    run_script --dry-run --only 107
+    assert_rc 0
+    assert_log "DRY-RUN: lxc 107"
+    OUT_HAS_111=$(printf '%s\n' "$OUT" | grep -c "DRY-RUN: lxc 111")
+    [ "$OUT_HAS_111" -eq 0 ] || fail "dry-run must respect --only (111 previewed)"
+    assert_calls_not "pct exec"
+}
+
+# 29. --list reflects --exclude classification.
+test_list_reflects_exclude() {
+    run_script --list --exclude 107
+    assert_rc 0
+    printf '%s\n' "$OUT" | grep -qF "107" || fail "107 row missing"
+    printf '%s\n' "$OUT" | grep "107" | grep -qF "[excluded]" || fail "107 not marked excluded"
+}
+
+# 30. --check with failing pvesh is a hard error.
+test_check_pvesh_failure() {
+    MOCK_PVESH_FAIL=1 run_script --check
+    assert_rc 2
+}
+
+# 31. --only without a value is a usage error.
+test_only_missing_value() {
+    run_script --only
+    assert_rc 2
+    assert_log "requires a value"
+}
+
 # ---- run -----------------------------------------------------------------
 for fn in $(declare -F | awk '$3 ~ /^test_/ {print $3}'); do
     t "${fn#test_}" "$fn"
