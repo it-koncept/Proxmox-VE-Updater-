@@ -16,6 +16,15 @@ It uses Proxmox **tags** to decide which package manager to run and skips e.g. W
 - Single-instance guard (`flock`) — safe if a cron run overlaps the previous one.
 - Per-guest exit codes, timestamped log lines, end summary, non-zero exit code on failures.
 - `--dry-run` mode to preview what would happen.
+- **Safety preflight (v3.2):** QEMU Guest Agent check, guest disk space,
+  backup-job coverage warnings — unknown prerequisites are skipped, never
+  reported as success.
+- **CLI (v3.1):** `--version`, `--list`, `--check`, `--only`, `--exclude`.
+- **Reporting (v3.3):** JSON report (`--report`), log file (`--log-file`),
+  per-guest status model (`success`/`warning`/`skipped`/`failed`/`planned`).
+- **Host updates (v3.4, policy-gated):** `--host` with typed-YES confirmation,
+  quorum and disk gates; never automatic, never reboots.
+- **Mock-based test suite (v3+):** 62 cases, PATH-shadowed PVE commands.
 
 ---
 
@@ -152,11 +161,11 @@ Run manually:
 ./update-vms.sh
 ```
 
-Schedule with cron (e.g. every night at 3 AM):
-
-```bash
-crontab -e
-```
+Schedule: prefer the systemd service/timer in `contrib/systemd/` (see
+"Scheduled operation" above — shipped default is `--dry-run`). A plain cron
+entry is possible but bypasses the journald integration; whatever scheduler
+you pick, a scheduled run must never include `--host` without a separate
+explicit policy decision (SEC-001):
 
 ```cron
 0 3 * * * /root/update-vms.sh >> /var/log/update-vms.log 2>&1
@@ -175,6 +184,9 @@ crontab -e
 | `DISK_CHECK`        | 1         | guest disk preflight on/off (0/1) (v3.2)  |
 | `AGENT_CHECK`       | 1         | QEMU Guest Agent preflight on/off (0/1) (v3.2) |
 | `BACKUP_CHECK`      | 1         | backup-job coverage warnings on/off (0/1) (v3.2) |
+| `HOST_UPDATE_TIMEOUT` | 3600    | per-phase timeout for host `apt-get` steps (v3.4) |
+| `MIN_HOST_FREE_MB`  | 1000      | min free MB on host `/` before `--host` run (v3.4) |
+| `HOST_REBOOT_MARKER` | `/var/run/reboot-required` | reboot-needed marker path (v3.4) |
 
 ### Safety preflight per guest (v3.2)
 
@@ -194,7 +206,7 @@ Before a tagged guest is updated:
 | Code | Meaning |
 |------|---------|
 | 0    | Success (all touched guests ok; skips are fine) |
-| 1    | One or more guests failed |
+| 1    | One or more guests failed (or a `--host` run failed) |
 | 2    | Preflight/usage error (not root, bad args/env, pvesh failure, missing binary) |
 | 3    | Another run holds the lock |
 
@@ -205,12 +217,14 @@ empty success.
 ### Running the tests (v3)
 
 ```bash
-./tests/run_tests.sh
+./tests/run_tests.sh            # 62 cases; optional name-substring arg
 ```
 
-Mock-based: real `pvesh`/`pct`/`qm`/`id` are shadowed by `tests/mocks/` via
-`PATH`, and every mock call is logged so tests can prove no real system
-command was reached. Never run the suite against real guests.
+Mock-based: real `pvesh`/`pct`/`qm`/`id`/`apt-get`/`pvecm` are shadowed by
+`tests/mocks/` via `PATH`, and every mock call is logged so tests can prove
+no real system command was reached. Unit files are validated with
+`systemd-analyze verify` when available. Never run the suite against real
+guests.
 
 > **Why the timeout matters:** `qm guest exec` defaults to **30 seconds**, which kills
 > long package installs mid-run and can leave dpkg/rpm in a broken state. This script
@@ -224,11 +238,14 @@ command was reached. Never run the suite against real guests.
 [2026-10-15 03:00:01] === update-vms start (node=prod-node) ===
 [2026-10-15 03:00:02] ▶ Updating 107 (lxc) [apt]
 [2026-10-15 03:01:10] ▶ Updating 101 (qemu) [yum/dnf]
-[2026-10-15 03:01:45]    ✗ failed (rc=1):
-     | Error: QEMU guest agent is not running
+[2026-10-15 03:01:45] 🟦 Skipping 102 (qemu) - Guest Agent not available (qm set 102 -agent enabled=1)
 [2026-10-15 03:01:45] 🟦 Skipping 150 (qemu) - tag: windows
 [2026-10-15 03:01:45] ⚪ Skipping 149 (lxc) - status stopped
-[2026-10-15 03:01:45] === done: 2 updated, 1 failed, 2 skipped ===
+[2026-10-15 03:02:00] === done: 2 updated, 0 failed, 3 skipped (0 with warnings) ===
+[2026-10-15 03:02:00] === per-guest results ===
+[2026-10-15 03:02:00]   107 lxc web01 [apt] success 68s
+[2026-10-15 03:02:00]   101 qemu db01 [yum/dnf] success 35s
+[2026-10-15 03:02:00]   102 qemu mail01 [none] skipped 0s - Guest Agent not available (qm set 102 -agent enabled=1)
 ```
 
 ---
