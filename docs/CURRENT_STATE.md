@@ -105,3 +105,20 @@ bagefter; CT 141 halvsønder af ældre afbrudt dist-upgrade (bullseye→trixie),
 repareret ved at færdiggøre dist-upgraden, godkendt af bruger).
 Resterende beslutninger: push til GitHub, evt. QEMU-agenter, CT 122/123
 (Debian 9 stretch EOL — kan ikke opgraderes som de er).
+
+## 9. Status efter Phase 1 (GUI-v2-projektet, 2026-10-15)
+
+GUI-v2-krakken ligger i nyt repo: `github.com/it-koncept/Proxmox-VE-Updater-Gui`
+(privat; indeholder PHASE0-AUDIT + fase-board via issues #1–9). Fase-beslutning
+fra audit: companion-backend + UI mod PVE-API'et — ingen patchning af PVE-GUI.
+
+Phase 1 (engine-hårdning, branch `feat/phase1-engine`, v3.5.0):
+- `--scan`: read-only pkg-preview (apt: index-refresh + `-s upgrade`; yum:
+  check-update, rc100=updates); `--host --scan` for værten. Rapport får
+  `packages`-arrays. Ingen install-kald (call-log-verificeret).
+- `--backup-status`: JSON på stdout (logs på stderr), `backup_status ok|unknown`,
+  pr. kandidat `backup_covered`.
+- Per-target låse (`TARGET_LOCK_DIR`); travl target → `skipped - target locked`,
+  aldrig kø, aldrig dobbeltkørsel. Global flock uændret.
+- Tests: 78/78 (63 gamle uændret grønne + 15 nye). ShellCheck ren.
+- IKKE deployet til prod-node; IKKE merged til main — afventer maintainer.

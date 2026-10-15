@@ -24,7 +24,9 @@ It uses Proxmox **tags** to decide which package manager to run and skips e.g. W
   per-guest status model (`success`/`warning`/`skipped`/`failed`/`planned`).
 - **Host updates (v3.4, policy-gated):** `--host` with typed-YES confirmation,
   quorum and disk gates; never automatic, never reboots.
-- **Mock-based test suite (v3+):** 62 cases, PATH-shadowed PVE commands.
+- **Scan interfaces (v3.5):** `--scan` read-only package preview per target,
+  `--backup-status` machine-readable JSON, per-target locks (`TARGET_LOCK_DIR`).
+- **Mock-based test suite (v3+):** 78 cases, PATH-shadowed PVE commands.
 
 ---
 
@@ -129,6 +131,28 @@ quorum is lost or host `/` free space is below `MIN_HOST_FREE_MB` (default
 1000), and aborts before dist-upgrade if `apt-get update` fails. A detected
 reboot requirement is reported as a warning — the tool never reboots.
 
+Scan with package preview (v3.5, read-only — requires root, changes no package state):
+
+```bash
+./update-vms.sh --scan                          # all apt/yum guests on this node
+./update-vms.sh --scan --only 107,141           # selected guests
+./update-vms.sh --host --scan                   # host: apt-get update + simulation
+./update-vms.sh --scan --report /tmp/scan.json  # per-guest "packages" arrays
+```
+
+`--scan` runs `apt-get update -qq` (index refresh only) + `apt-get -s upgrade` in
+apt guests and `dnf/yum check-update` in yum guests; nothing is installed. A target
+currently locked by another run is reported `skipped - target locked by another run`.
+
+Backup status as machine-readable JSON (v3.5; JSON on stdout, logs on stderr):
+
+```bash
+./update-vms.sh --backup-status | jq .
+```
+
+Gives `backup_status: ok|unknown`, `enabled_backup_jobs`, and per-candidate
+`backup_covered`. An unreadable job list yields `unknown` — never "covered".
+
 ## Scheduled operation (optional, v3.4)
 
 `contrib/systemd/` ships a oneshot service + weekly timer (Sunday 03:30,
@@ -180,6 +204,7 @@ explicit policy decision (SEC-001):
 | `QEMU_EXEC_TIMEOUT` | 1800      | `qm guest exec --timeout` in seconds      |
 | `PCT_EXEC_TIMEOUT`  | 1800      | `timeout` wrapper around `pct exec` (v3)  |
 | `LOCK_FILE`         | `/var/lock/update-vms.lock` | Single-instance lock path (v3)          |
+| `TARGET_LOCK_DIR`   | `/var/lock` | Per-target lock directory (v3.5)        |
 | `MIN_GUEST_FREE_MB` | 500       | min free MB on guest `/` before upgrade (v3.2) |
 | `DISK_CHECK`        | 1         | guest disk preflight on/off (0/1) (v3.2)  |
 | `AGENT_CHECK`       | 1         | QEMU Guest Agent preflight on/off (0/1) (v3.2) |

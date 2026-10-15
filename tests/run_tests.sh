@@ -29,6 +29,7 @@ reset_env() {
     # defaults: pretend root, basic fixture, no injected failures
     export PVE_NODE=testnode
     export LOCK_FILE="$T_LOCK"
+    export TARGET_LOCK_DIR="$T_DIR"
     export MOCK_CALLS="$T_CALLS"
     export MOCK_FIXTURES="$FIXTURES"
     export MOCK_ID_UID=0
@@ -38,6 +39,7 @@ reset_env() {
     export MOCK_GUEST_DF_FAIL_VMS="" MOCK_BACKUP_FAIL=0
     export MOCK_APT_UPDATE_FAIL=0 MOCK_APT_DIST_FAIL=0 MOCK_PVECM_MODE=standalone
     unset MOCK_PVECM_FIXTURE
+    unset MOCK_PCT_SCAN_MODE MOCK_PCT_YUM_SCAN MOCK_QM_SCAN_MODE MOCK_APT_SCAN_MODE
     unset PCT_EXEC_TIMEOUT QEMU_EXEC_TIMEOUT MOCK_PVESH_FIXTURE
     unset MOCK_GUEST_DF MOCK_BACKUP_FIXTURE MIN_GUEST_FREE_MB
     unset DISK_CHECK AGENT_CHECK BACKUP_CHECK
@@ -48,6 +50,12 @@ reset_env() {
 
 run_script() {
     OUT=$(PATH="$MOCKDIR:$PATH" bash "$SCRIPT" "$@" 2>&1)
+    RC=$?
+}
+
+# stdout-only capture for machine-readable modes (JSON on stdout, logs on stderr)
+run_script_stdout() {
+    OUT=$(PATH="$MOCKDIR:$PATH" bash "$SCRIPT" "$@" 2>/dev/null)
     RC=$?
 }
 
@@ -612,6 +620,146 @@ test_systemd_units_valid() {
     local out
     out=$(cd "$T_DIR" && systemd-analyze verify update-vms.service update-vms.timer 2>&1)
     [ -z "$out" ] || fail "systemd-analyze verify: $out"
+}
+
+# ---- v3.5 scan / backup-status / per-target lock tests --------------------
+
+# 63. Host scan: simulation only, package preview in report, no installs.
+test_host_scan_packages() {
+    run_script --host --scan --report "$T_DIR/r.json"
+    assert_rc 0
+    assert_log "host scan: 2 package update(s) available"
+    assert_calls "apt-get -s dist-upgrade"
+    assert_calls_not "apt-get -y"
+    [ "$(jq -r '.mode' "$T_DIR/r.json")" = "host-scan" ] || fail "mode not host-scan"
+    [ "$(jq -r '.guests[0].status' "$T_DIR/r.json")" = "success" ] || fail "host not success"
+    [ "$(jq '.guests[0].packages | length' "$T_DIR/r.json")" -eq 2 ] || fail "packages != 2"
+}
+
+# 64. Host scan: failed apt-get update -> failed, exit 1, no simulation.
+test_host_scan_update_fail() {
+    MOCK_APT_UPDATE_FAIL=1 run_script --host --scan
+    assert_rc 1
+    assert_log "apt-get update failed"
+    assert_calls_not "apt-get -s dist-upgrade"
+}
+
+# 65. Host scan: up-to-date host.
+test_host_scan_current() {
+    MOCK_APT_SCAN_MODE=current run_script --host --scan
+    assert_rc 0
+    assert_log "host scan: up to date"
+}
+
+# 66. Guest scan (apt): read-only, package preview, zero mutating calls.
+test_guest_scan_apt_packages() {
+    run_script --scan --report "$T_DIR/r.json"
+    assert_rc 0
+    assert_calls "pct exec 107"
+    assert_calls_not "apt-get -y"
+    assert_calls_not "dist-upgrade"
+    [ "$(jq -r '.mode' "$T_DIR/r.json")" = "scan" ] || fail "mode not scan"
+    [ "$(jq -r '.guests[] | select(.vmid==107) | .status' "$T_DIR/r.json")" = "success" ] || fail "107 not success"
+    [ "$(jq '.guests[] | select(.vmid==107) | .packages | length' "$T_DIR/r.json")" -eq 2 ] || fail "107 packages != 2"
+}
+
+# 67. Guest scan: up-to-date guest.
+test_guest_scan_current() {
+    MOCK_PCT_SCAN_MODE=current run_script --scan
+    assert_rc 0
+    assert_log "up to date"
+}
+
+# 68. Guest scan (yum): rc 100 means updates available, parsed.
+test_guest_scan_yum_available() {
+    run_script --scan --report "$T_DIR/r.json"
+    assert_rc 0
+    assert_log "2 update(s) available"
+    [ "$(jq -r '.guests[] | select(.vmid==102) | .status' "$T_DIR/r.json")" = "success" ] || fail "102 not success"
+}
+
+# 69. Guest scan (yum): command failure -> failed, exit 1, never success.
+test_guest_scan_yum_fail() {
+    MOCK_QM_SCAN_MODE=fail run_script --scan
+    assert_rc 1
+    assert_log "scan failed (rc=1)"
+}
+
+# 70. Guest scan: QEMU without agent -> skipped, never scanned.
+test_scan_no_agent_skip() {
+    MOCK_QM_AGENT_DOWN_VMS=102 run_script --scan
+    assert_rc 0
+    assert_log "Skipping 102 (qemu) - no guest agent"
+    assert_calls_not "qm guest exec 102"
+}
+
+# 71. Scan respects per-target lock held by another process (FR-014).
+test_scan_target_locked() {
+    flock "$T_DIR/update-vms-lxc-107.lock" -c 'sleep 5' &
+    local holder=$!
+    sleep 0.5
+    run_script --scan --only 107
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+    assert_rc 0
+    assert_log "target locked by another run"
+    assert_calls_not "pct exec 107"
+}
+
+# 72. Update run skips a target whose lock is held; others proceed.
+test_update_target_locked() {
+    flock "$T_DIR/update-vms-lxc-107.lock" -c 'sleep 5' &
+    local holder=$!
+    sleep 0.5
+    run_script
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+    assert_rc 0
+    assert_log "Skipping 107 (lxc) - target locked by another run"
+    assert_calls_not "pct exec 107 -- bash -c export DEBIAN_FRONTEND"
+    assert_calls "pct exec 111"
+}
+
+# 73. --backup-status: machine-readable JSON, coverage flags.
+test_backup_status_json() {
+    MOCK_BACKUP_FIXTURE="$FIXTURES/jobs_partial.json" run_script_stdout --backup-status
+    assert_rc 0
+    printf '%s' "$OUT" | jq -e . >/dev/null || fail "output not JSON"
+    [ "$(printf '%s' "$OUT" | jq -r '.backup_status')" = "ok" ] || fail "backup_status not ok"
+    [ "$(printf '%s' "$OUT" | jq '.candidates | length')" -eq 3 ] || fail "candidates != 3"
+    [ "$(printf '%s' "$OUT" | jq -r '.candidates[] | select(.vmid==107) | .backup_covered')" = "true" ] || fail "107 should be covered"
+    [ "$(printf '%s' "$OUT" | jq -r '.candidates[] | select(.vmid==102) | .backup_covered')" = "false" ] || fail "102 should NOT be covered"
+}
+
+# 74. --backup-status: unreadable job list -> unknown, never healthy.
+test_backup_status_unknown() {
+    MOCK_BACKUP_FAIL=1 run_script_stdout --backup-status
+    assert_rc 0
+    [ "$(printf '%s' "$OUT" | jq -r '.backup_status')" = "unknown" ] || fail "backup_status not unknown"
+    [ "$(printf '%s' "$OUT" | jq -r '.candidates[0].backup_covered')" = "false" ] || fail "unknown must not report covered"
+}
+
+# 75. Scan requires root (execs into guests).
+test_scan_nonroot_refused() {
+    unset MOCK_ID_UID
+    run_script --scan
+    assert_rc 2
+    assert_log "root"
+    assert_calls_not "pct exec"
+}
+
+# 76. Mode conflicts rejected: --scan with --list; --backup-status standalone.
+test_scan_mode_conflicts() {
+    run_script --scan --list
+    assert_rc 2
+    run_script --backup-status --host
+    assert_rc 2
+}
+
+# 77. Existing update reports stay valid JSON with the new packages field.
+test_report_packages_field_backward_compat() {
+    run_script --report "$T_DIR/r.json"
+    assert_rc 0
+    jq -e '.guests | all(has("packages"))' "$T_DIR/r.json" >/dev/null || fail "packages field missing"
+    [ "$(jq '.guests[] | select(.vmid==107) | .packages | length' "$T_DIR/r.json")" -eq 0 ] || fail "update run must not carry packages"
 }
 
 # ---- run -----------------------------------------------------------------

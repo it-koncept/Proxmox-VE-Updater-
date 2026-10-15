@@ -4,6 +4,16 @@
 # MOCK_APT_DIST_FAIL=1: 'dist-upgrade' fails (rc 100).
 echo "apt-get $*" >> "$MOCK_CALLS"
 case "$*" in
+    *-s\ dist-upgrade*)
+        # v3.5 host scan: simulation only
+        if [ "${MOCK_APT_SCAN_MODE:-updates}" = "current" ]; then
+            echo "0 upgraded, 0 newly installed, 0 to remove"
+            exit 0
+        fi
+        echo "Inst mockpkg1 [1.0] (1.1 mock)"
+        echo "Inst mockpkg2 [2.0] (2.1 mock)"
+        echo "2 upgraded"
+        ;;
     *dist-upgrade*)
         if [ "${MOCK_APT_DIST_FAIL:-0}" = "1" ]; then
             echo "E: dist-upgrade failed (mock)" >&2

@@ -8,6 +8,21 @@
 #   yum     -> dnf -y update if present, else yum -y update
 #   windows -> skipped
 #
+# v3.5 (Phase 1) adds stable engine interfaces for the GUI backend:
+#   --scan             READ-ONLY scan with package preview (FR-002/FR-007):
+#                      guests: apt -> apt-get update -qq (index only) + apt-get -s
+#                      upgrade; yum -> dnf/yum check-update (rc 100 = updates).
+#                      host (--host --scan): apt-get update + apt-get -s
+#                      dist-upgrade. No package state is changed anywhere.
+#                      Report gains per-guest "packages" array + counts.
+#                      Requires root (execs into guests); takes NO global lock
+#                      but per-target locks (busy target -> skipped, never queued).
+#   --backup-status    machine-readable JSON: job coverage per update candidate
+#                      + backup_status ok|unknown (FR-009/FR-010 groundwork).
+#   per-target locks   TARGET_LOCK_DIR (default /var/lock): update-vms-<type>-
+#                      <vmid>.lock held during guest exec (FR-014); the global
+#                      LOCK_FILE guard is unchanged.
+#
 # v3.4 (B7) adds host updates (FR-002, SEC-001/003/013) - gated by policy:
 #   --host             update THIS host: apt-get update && dist-upgrade
 #   --yes              skip interactive confirmation (explicit policy only;
@@ -79,13 +94,14 @@
 #
 set -u -o pipefail
 
-VERSION="3.4.0"
+VERSION="3.5.0"
 EXIT_OK=0
 EXIT_GUEST_FAILURE=1
 EXIT_PREFLIGHT=2
 EXIT_LOCK=3
 
 LOCK_FILE="${LOCK_FILE:-/var/lock/update-vms.lock}"
+TARGET_LOCK_DIR="${TARGET_LOCK_DIR:-/var/lock}"
 NODE="${PVE_NODE:-$(hostname)}"
 QEMU_EXEC_TIMEOUT="${QEMU_EXEC_TIMEOUT:-1800}"
 PCT_EXEC_TIMEOUT="${PCT_EXEC_TIMEOUT:-1800}"
@@ -99,6 +115,8 @@ BACKUP_CHECK="${BACKUP_CHECK:-1}"
 DRY_RUN=0
 LIST=0
 CHECK=0
+SCAN=0
+BSM=0
 HOST_MODE=0
 ASSUME_YES=0
 ONLY=""
@@ -114,7 +132,13 @@ trap 'rm -f "$GUESTS_FILE"' EXIT
 log() {
     local line
     line="[$(date '+%F %T')] $*"
-    echo "$line"
+    # --backup-status emits machine-readable JSON on stdout: keep stdout pure
+    # by routing log lines to stderr in that mode.
+    if [ "$BSM" -eq 1 ]; then
+        echo "$line" >&2
+    else
+        echo "$line"
+    fi
     if [ -n "$LOG_FILE_PATH" ]; then
         if ! printf '%s\n' "$line" >> "$LOG_FILE_PATH"; then
             echo "error: cannot write log file: $LOG_FILE_PATH" >&2
@@ -124,9 +148,10 @@ log() {
 
 # Per-guest record (TSV -> JSON at report time). Reason is tab-sanitized.
 record_guest() {
-    # record_guest <vmid> <type> <name> <action> <status> <reason> <duration_s>
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$1" "$2" "${3//$'\t'/ }" "$4" "$5" "${6//$'\t'/ }" "$7" >> "$GUESTS_FILE"
+    # record_guest <vmid> <type> <name> <action> <status> <reason> <duration_s> [packages]
+    local pkgs="${8:-}"
+    printf '%s	%s	%s	%s	%s	%s	%s	%s\n' \
+        "$1" "$2" "${3//$'	'/ }" "$4" "$5" "${6//$'	'/ }" "$7" "${pkgs//$'	'/,}" >> "$GUESTS_FILE"
 }
 
 usage() {
@@ -142,10 +167,13 @@ usage: $(basename "$0") [options]
   --report <path>  write JSON report to path after the run (v3.3)
   --log-file <p>   also append log lines to file (v3.3)
   --host           update this host (apt update + dist-upgrade) (v3.4)
+  --scan           read-only update scan with package preview (v3.5, root)
+  --backup-status  JSON: backup-job coverage per candidate (v3.5, root)
   --yes            non-interactive confirmation for --host (explicit policy)
   -h, --help       this help
 safety env: MIN_GUEST_FREE_MB (default 500), DISK_CHECK/AGENT_CHECK/BACKUP_CHECK (1|0)
 host env: HOST_UPDATE_TIMEOUT (3600), MIN_HOST_FREE_MB (1000), HOST_REBOOT_MARKER
+lock env: TARGET_LOCK_DIR (default /var/lock) - per-target locks (v3.5)
 exit codes: 0 ok | 1 guest failure(s) | 2 preflight/usage | 3 lock busy
 EOF
 }
@@ -178,6 +206,8 @@ while [ $# -gt 0 ]; do
             require_value --log-file $#; LOG_FILE_PATH="$2"; shift ;;
         --log-file=*)  LOG_FILE_PATH="${1#--log-file=}" ;;
         --host)    HOST_MODE=1 ;;
+        --scan)    SCAN=1 ;;
+        --backup-status) BSM=1 ;;
         --yes)     ASSUME_YES=1 ;;
         -h|--help) usage; exit "$EXIT_OK" ;;
         *) echo "error: unknown argument: $1" >&2; usage; exit "$EXIT_PREFLIGHT" ;;
@@ -233,6 +263,20 @@ if [ "$HOST_MODE" -eq 1 ] && { [ -n "$ONLY" ] || [ -n "$EXCLUDE" ] || [ "$LIST" 
     log "preflight: --host cannot be combined with --only/--exclude/--list/--check"
     exit "$EXIT_PREFLIGHT"
 fi
+# --scan combines with --host (host scan) and --only/--exclude, never with the
+# other read-only modes; --backup-status is standalone (filters allowed).
+if [ "$SCAN" -eq 1 ] && { [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ] || [ "$BSM" -eq 1 ]; }; then
+    log "preflight: --scan cannot be combined with --list/--check/--backup-status"
+    exit "$EXIT_PREFLIGHT"
+fi
+if [ "$BSM" -eq 1 ] && { [ "$HOST_MODE" -eq 1 ] || [ "$SCAN" -eq 1 ] || [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; }; then
+    log "preflight: --backup-status must run standalone (only --only/--exclude allowed)"
+    exit "$EXIT_PREFLIGHT"
+fi
+if [ ! -d "$TARGET_LOCK_DIR" ] || [ ! -w "$TARGET_LOCK_DIR" ]; then
+    log "preflight: TARGET_LOCK_DIR not writable: $TARGET_LOCK_DIR"
+    exit "$EXIT_PREFLIGHT"
+fi
 for flag in DISK_CHECK AGENT_CHECK BACKUP_CHECK; do
     case "${!flag}" in
         0|1) ;;
@@ -266,6 +310,16 @@ if [ "$(id -u)" -ne 0 ] && [ "$DRY_RUN" -ne 1 ] && [ "$LIST" -ne 1 ]; then
     log "preflight: root is required for real runs (use --dry-run or --list as non-root)"
     exit "$EXIT_PREFLIGHT"
 fi
+
+# Per-target lock (FR-014). Returns: 0 acquired (fd 8 open) | 1 busy | 2 error.
+target_lock() {
+    local path="$TARGET_LOCK_DIR/update-vms-$1-$2.lock"
+    if ! { exec 8>"$path"; } 2>/dev/null; then return 2; fi
+    if flock -n 8; then return 0; fi
+    exec 8>&-
+    return 1
+}
+target_unlock() { flock -u 8 2>/dev/null; exec 8>&-; }
 
 # Exact match of a tag in a ';'-separated PVE tag list (case-insensitive).
 has_tag() {
@@ -351,11 +405,12 @@ write_report() {
         '{success:$s, warning:$w, skipped:$k, failed:$f}')
     guests=$(jq -R -s -c '
         split("\n") | map(select(length > 0)) | map(split("\t") |
-        (.[0] as $id | .[6] as $dur |
+        (.[0] as $id | .[6] as $dur | .[7] as $pkgs |
         { vmid: ($id | tonumber? // $id),
           type: .[1], name: .[2], action: .[3],
           status: .[4], reason: .[5],
-          duration_s: ($dur | tonumber? // 0) }))' "$GUESTS_FILE")
+          duration_s: ($dur | tonumber? // 0),
+          packages: (($pkgs // "") as $p | (if $p == "" then [] else ($p | split(",")) end)) }))' "$GUESTS_FILE")
     if ! jq -n --arg tool "update-vms" --arg version "$VERSION" --arg node "$NODE" \
             --arg mode "$mode_kind" --arg started "$STARTED" --arg finished "$finished" \
             --argjson duration_s "$total" --argjson summary "$summary" --argjson guests "$guests" \
@@ -505,10 +560,89 @@ run_guest_cmd() {
 
 APT_CMD='export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade'
 YUM_CMD='if command -v dnf >/dev/null 2>&1; then dnf -y update; else yum -y update; fi'
+# Scan commands (v3.5): read-only w.r.t. package state. apt-get update -qq only
+# refreshes the index; -s / check-update never install.
+APT_SCAN='apt-get update -qq >/dev/null 2>&1; apt-get -s upgrade'
+YUM_SCAN='if command -v dnf >/dev/null 2>&1; then dnf -q check-update; else yum -q check-update; fi'
 
-# ---- host update mode (v3.4) ----------------------------------------------
+# Scan exec: sets SCAN_OUT / SCAN_RC (guest rc; for yum, 100 = updates available).
+scan_guest_cmd() {
+    # scan_guest_cmd <type> <vmid> <shell-command>
+    local type="$1" vmid="$2" cmd="$3" out rc
+    if [ "$type" = "lxc" ]; then
+        out=$(timeout "$PCT_EXEC_TIMEOUT" pct exec "$vmid" -- bash -c "$cmd" 2>&1)
+        rc=$?
+    else
+        out=$(qm guest exec "$vmid" --timeout "$QEMU_EXEC_TIMEOUT" -- bash -c "$cmd" 2>&1)
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            rc=$(printf '%s' "$out" | jq -r '.exitcode // 0' 2>/dev/null || echo 1)
+            out=$(printf '%s' "$out" | jq -r '.out-data // ""' 2>/dev/null)
+        fi
+    fi
+    SCAN_OUT="$out"; SCAN_RC="$rc"
+}
+
+# Parse scan output -> SCAN_COUNT + comma-joined SCAN_PKGS (max 200).
+parse_apt_scan() {
+    SCAN_COUNT=$(printf '%s\n' "$1" | grep -c '^Inst ' || true)
+    SCAN_PKGS=$(printf '%s\n' "$1" | awk '/^Inst /{print $2}' | head -200 | paste -sd, -)
+}
+parse_yum_scan() {
+    SCAN_COUNT=$(printf '%s\n' "$1" | awk '/^[^[:space:]]+[[:space:]]+[0-9]/{print $1}' | wc -l)
+    SCAN_PKGS=$(printf '%s\n' "$1" | awk '/^[^[:space:]]+[[:space:]]+[0-9]/{print $1}' | head -200 | paste -sd, -)
+}
+
+# Host scan (v3.5, FR-002/FR-007): index refresh + simulation only.
+run_host_scan() {
+    local out rc hstart=$SECONDS
+    for bin in apt-get timeout; do
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            log "host preflight: required command not found: $bin"
+            return "$EXIT_PREFLIGHT"
+        fi
+    done
+    if ! target_lock host "$NODE"; then
+        log "⏭ HOST scan skipped - target locked by another run"
+        return "$EXIT_OK"
+    fi
+    out=$(timeout "$HOST_UPDATE_TIMEOUT" apt-get update 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "host scan: apt-get update failed (rc=$rc)"
+        printf '%s\n' "$out" | tail -5 | sed 's/^/   | /'
+        record_guest "host" "host" "$NODE" "scan" failed "apt-get update failed" $((SECONDS-hstart))
+        target_unlock
+        if [ -n "$REPORT_PATH" ]; then write_report "host-scan"; fi
+        return "$EXIT_GUEST_FAILURE"
+    fi
+    out=$(timeout "$HOST_UPDATE_TIMEOUT" apt-get -s dist-upgrade 2>&1); rc=$?
+    target_unlock
+    if [ "$rc" -ne 0 ]; then
+        log "host scan: apt-get -s dist-upgrade failed (rc=$rc)"
+        printf '%s\n' "$out" | tail -5 | sed 's/^/   | /'
+        record_guest "host" "host" "$NODE" "scan" failed "simulation failed" $((SECONDS-hstart))
+        if [ -n "$REPORT_PATH" ]; then write_report "host-scan"; fi
+        return "$EXIT_GUEST_FAILURE"
+    fi
+    parse_apt_scan "$out"
+    if [ "$SCAN_COUNT" -gt 0 ]; then
+        log "host scan: $SCAN_COUNT package update(s) available"
+        record_guest "host" "host" "$NODE" "scan" success "$SCAN_COUNT updates available" $((SECONDS-hstart)) "$SCAN_PKGS"
+    else
+        log "host scan: up to date"
+        record_guest "host" "host" "$NODE" "scan" success "up to date" $((SECONDS-hstart))
+    fi
+    if [ -n "$REPORT_PATH" ]; then write_report "host-scan"; fi
+    return "$EXIT_OK"
+}
+
+# ---- host mode dispatch (v3.4 update / v3.5 scan) -------------------------
 if [ "$HOST_MODE" -eq 1 ]; then
-    run_host_update
+    if [ "$SCAN" -eq 1 ]; then
+        run_host_scan
+    else
+        run_host_update
+    fi
     exit $?
 fi
 
@@ -584,6 +718,147 @@ if [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ]; then
         fi
     fi
     exit "$EXIT_OK"
+fi
+
+# ---- backup-status mode (v3.5, FR-009/FR-010): JSON, no changes, no lock --
+if [ "$BSM" -eq 1 ]; then
+    cands=""
+    while IFS= read -r VM; do
+        VMID=$(printf '%s' "$VM" | jq -r '.vmid')
+        TYPE=$(printf '%s' "$VM" | jq -r '.type')
+        STATUS=$(printf '%s' "$VM" | jq -r '.status')
+        TAGS=$(printf '%s' "$VM" | jq -r '.tags // ""')
+        NAME=$(printf '%s' "$VM" | jq -r '.name // ""')
+        ACTION=$(guest_action "$VMID" "$STATUS" "$TAGS")
+        case "$ACTION" in apt|yum) ;; *) continue ;; esac
+        covered=0
+        if [ "$BACKUP_STATUS" = "ok" ] && backup_covers "$VMID"; then covered=1; fi
+        cands+=$(printf '%s\t%s\t%s\t%s\n' "$VMID" "$TYPE" "${NAME//$'\t'/ }" "$covered")$'\n'
+    done < <(printf '%s' "$resources" | jq -c --arg node "$NODE" '.[] | select(.node == $node)')
+    jq -n --arg tool "update-vms" --arg version "$VERSION" --arg node "$NODE" \
+          --arg mode "backup-status" --arg backup_status "$BACKUP_STATUS" \
+          --argjson jobs "$(printf '%s' "$BACKUP_JOBS" | jq -c '[.[] | select((.enabled // 0) | tostring == "1")] | length')" \
+          --rawfile cands <(printf '%s' "$cands") \
+        '{tool:$tool, version:$version, node:$node, mode:$mode,
+          backup_status:$backup_status, enabled_backup_jobs:$jobs,
+          candidates:($cands | split("\n") | map(select(length > 0)) | map(split("\t") |
+            { vmid: (.[0] | tonumber? // .[0]), type: .[1], name: .[2],
+              backup_covered: (.[3] == "1") }))}'
+    exit "$EXIT_OK"
+fi
+
+# ---- scan mode (v3.5, FR-002/FR-007): read-only w.r.t. package state ------
+# No global lock (scans must stay available during update runs); per-target
+# locks make a target that is being updated report as locked-skipped.
+if [ "$SCAN" -eq 1 ]; then
+    log "=== update-vms start (node=$NODE, scan) ==="
+    if [ "$node_guest_count" -eq 0 ]; then
+        log "⚠ no guests found on node $NODE (fetched $total_count total) - check PVE_NODE"
+    fi
+    while IFS= read -r VM; do
+        VMID=$(printf '%s' "$VM" | jq -r '.vmid')
+        TYPE=$(printf '%s' "$VM" | jq -r '.type')
+        STATUS=$(printf '%s' "$VM" | jq -r '.status')
+        TAGS=$(printf '%s' "$VM" | jq -r '.tags // ""')
+        NAME=$(printf '%s' "$VM" | jq -r '.name // ""')
+        gstart=$SECONDS
+
+        if ! [[ "$VMID" =~ ^[0-9]+$ ]]; then
+            log "⚠ Skipping malformed entry (vmid=$VMID)"
+            record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "malformed entry" 0
+            SKIP=$((SKIP+1)); continue
+        fi
+        if [ -n "$ONLY" ] && ! in_list "$ONLY" "$VMID"; then
+            record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "not in --only list" 0
+            SKIP=$((SKIP+1)); continue
+        fi
+        if [ -n "$EXCLUDE" ] && in_list "$EXCLUDE" "$VMID"; then
+            record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "in --exclude list" 0
+            SKIP=$((SKIP+1)); continue
+        fi
+        if [ "$STATUS" != "running" ]; then
+            record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "status $STATUS" 0
+            SKIP=$((SKIP+1)); continue
+        fi
+        if has_tag "$TAGS" "windows"; then
+            record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "tag: windows" 0
+            SKIP=$((SKIP+1)); continue
+        fi
+        SCAN_CMD=""; SCAN_KIND=""
+        if has_tag "$TAGS" "yum"; then
+            SCAN_CMD="$YUM_SCAN"; SCAN_KIND="yum/dnf"
+        elif has_tag "$TAGS" "apt"; then
+            SCAN_CMD="$APT_SCAN"; SCAN_KIND="apt"
+        else
+            record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "no apt/yum/windows tag" 0
+            SKIP=$((SKIP+1)); continue
+        fi
+        if [ "$AGENT_CHECK" -eq 1 ] && [ "$TYPE" = "qemu" ] && ! guest_has_agent "$VMID"; then
+            log "⏭ Skipping $VMID (qemu) - no guest agent"
+            record_guest "$VMID" "$TYPE" "$NAME" "$SCAN_KIND" skipped "no guest agent" 0
+            SKIP=$((SKIP+1)); continue
+        fi
+        tlrc=0
+        target_lock "$TYPE" "$VMID" || tlrc=$?
+        if [ "$tlrc" -eq 1 ]; then
+            log "⏭ Skipping $VMID ($TYPE) - target locked by another run"
+            record_guest "$VMID" "$TYPE" "$NAME" "$SCAN_KIND" skipped "target locked by another run" 0
+            SKIP=$((SKIP+1)); continue
+        elif [ "$tlrc" -eq 2 ]; then
+            log "⏭ Skipping $VMID ($TYPE) - cannot open target lock"
+            record_guest "$VMID" "$TYPE" "$NAME" "$SCAN_KIND" skipped "cannot open target lock" 0
+            SKIP=$((SKIP+1)); continue
+        fi
+        log "▶ Scanning $VMID ($TYPE) [$SCAN_KIND]"
+        scan_guest_cmd "$TYPE" "$VMID" "$SCAN_CMD"
+        gdur=$((SECONDS-gstart))
+        target_unlock
+        if [ "$SCAN_KIND" = "apt" ]; then
+            if [ "$SCAN_RC" -ne 0 ]; then
+                log "   ✗ scan failed (rc=$SCAN_RC):"
+                printf '%s\n' "$SCAN_OUT" | tail -5 | sed 's/^/     | /'
+                FAIL=$((FAIL+1))
+                record_guest "$VMID" "$TYPE" "$NAME" "$SCAN_KIND" failed "scan command failed" "$gdur"
+            else
+                parse_apt_scan "$SCAN_OUT"
+                if [ "$SCAN_COUNT" -gt 0 ]; then
+                    log "   $SCAN_COUNT update(s) available"
+                    OK=$((OK+1))
+                    record_guest "$VMID" "$TYPE" "$NAME" "$SCAN_KIND" success "$SCAN_COUNT updates available" "$gdur" "$SCAN_PKGS"
+                else
+                    log "   up to date"
+                    OK=$((OK+1))
+                    record_guest "$VMID" "$TYPE" "$NAME" "$SCAN_KIND" success "up to date" "$gdur"
+                fi
+            fi
+        else
+            if [ "$SCAN_RC" -eq 100 ]; then
+                parse_yum_scan "$SCAN_OUT"
+                log "   $SCAN_COUNT update(s) available"
+                OK=$((OK+1))
+                record_guest "$VMID" "$TYPE" "$NAME" "$SCAN_KIND" success "$SCAN_COUNT updates available" "$gdur" "$SCAN_PKGS"
+            elif [ "$SCAN_RC" -eq 0 ]; then
+                log "   up to date"
+                OK=$((OK+1))
+                record_guest "$VMID" "$TYPE" "$NAME" "$SCAN_KIND" success "up to date" "$gdur"
+            else
+                log "   ✗ scan failed (rc=$SCAN_RC):"
+                printf '%s\n' "$SCAN_OUT" | tail -5 | sed 's/^/     | /'
+                FAIL=$((FAIL+1))
+                record_guest "$VMID" "$TYPE" "$NAME" "$SCAN_KIND" failed "scan command failed (rc=$SCAN_RC)" "$gdur"
+            fi
+        fi
+    done < <(printf '%s' "$resources" | jq -c --arg node "$NODE" '.[] | select(.node == $node)')
+    updated_total=$((OK+WARN))
+    extra=""
+    [ "$WARN" -gt 0 ] && extra=" ($WARN with warnings)"
+    log "=== done: $updated_total updated, $FAIL failed, $SKIP skipped$extra ==="
+    rc="$EXIT_OK"
+    [ "$FAIL" -gt 0 ] && rc="$EXIT_GUEST_FAILURE"
+    if [ -n "$REPORT_PATH" ]; then
+        write_report "scan" || rc="$EXIT_PREFLIGHT"
+    fi
+    exit "$rc"
 fi
 
 # ---- update / dry-run path: lock before touching anything ----------------
@@ -682,10 +957,23 @@ while IFS= read -r VM; do
         GUEST_WARN=1
     fi
 
+    # per-target lock (v3.5, FR-014): never two mutating runs on one target
+    tlrc=0
+    target_lock "$TYPE" "$VMID" || tlrc=$?
+    if [ "$tlrc" -eq 1 ]; then
+        log "⏭ Skipping $VMID ($TYPE) - target locked by another run"
+        record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" skipped "target locked by another run" 0
+        SKIP=$((SKIP+1)); continue
+    elif [ "$tlrc" -eq 2 ]; then
+        log "⏭ Skipping $VMID ($TYPE) - cannot open target lock"
+        record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" skipped "cannot open target lock" 0
+        SKIP=$((SKIP+1)); continue
+    fi
     log "▶ Updating $VMID ($TYPE) [$UPDATE_KIND]"
     gdur=0
     if run_guest_cmd "$TYPE" "$VMID" "$UPDATE_CMD"; then
         gdur=$((SECONDS-gstart))
+        target_unlock
         if [ "$DRY_RUN" -eq 1 ]; then
             record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" planned "dry-run preview" "$gdur"
             OK=$((OK+1))
@@ -698,6 +986,7 @@ while IFS= read -r VM; do
         fi
     else
         gdur=$((SECONDS-gstart))
+        target_unlock
         FAIL=$((FAIL+1))
         record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" failed "update command failed" "$gdur"
     fi

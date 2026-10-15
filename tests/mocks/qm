@@ -18,6 +18,23 @@ if [ "${1:-}" = "guest" ] && [ "${2:-}" = "exec" ]; then
         echo "QEMU guest agent is not running" >&2
         exit 1
     fi
+    # v3.5 scan commands (read-only): apt-get -s upgrade / check-update
+    if printf '%s' "$*" | grep -q "apt-get -s upgrade"; then
+        case "${MOCK_QM_SCAN_MODE:-updates}" in
+            current) printf '{"exitcode": 0, "out-data": "0 upgraded"}\n' ;;
+            fail)    printf '{"exitcode": 100, "out-data": "E: scan failed (mock)"}\n' ;;
+            *)       printf '{"exitcode": 0, "out-data": "Inst mockpkg1 [1.0] (1.1 mock)\\nInst mockpkg2 [2.0] (2.1 mock)"}\n' ;;
+        esac
+        exit 0
+    fi
+    if printf '%s' "$*" | grep -q "check-update"; then
+        case "${MOCK_QM_SCAN_MODE:-available}" in
+            current) printf '{"exitcode": 0, "out-data": ""}\n' ;;
+            fail)    printf '{"exitcode": 1, "out-data": "Error (mock)"}\n' ;;
+            *)       printf '{"exitcode": 100, "out-data": "mockpkg1.x86_64    1.1-1.el8    mockrepo\\nmockpkg2.x86_64    2.1-1.el8    mockrepo"}\n' ;;
+        esac
+        exit 0
+    fi
     printf '{"exitcode": %s, "out-data": ""}\n' "${MOCK_QM_RC:-0}"
 fi
 exit 0

@@ -18,6 +18,23 @@ if [ "${1:-}" = "exec" ]; then
     if [ "${MOCK_PCT_HANG:-0}" = "1" ]; then
         sleep 10
     fi
+    # v3.5 scan commands (read-only): apt-get -s upgrade / check-update
+    if printf '%s' "$*" | grep -q "apt-get -s upgrade"; then
+        case "${MOCK_PCT_SCAN_MODE:-updates}" in
+            current) echo "Reading state information... 0 upgraded, 0 newly installed"; exit 0 ;;
+            fail)    echo "E: scan failed (mock)" >&2; exit 100 ;;
+        esac
+        printf 'Inst mockpkg1 [1.0] (1.1 mock)\nInst mockpkg2 [2.0] (2.1 mock)\n2 upgraded\n'
+        exit 0
+    fi
+    if printf '%s' "$*" | grep -q "check-update"; then
+        case "${MOCK_PCT_YUM_SCAN:-available}" in
+            current) exit 0 ;;
+            fail)    echo "Error: check-update failed (mock)" >&2; exit 1 ;;
+        esac
+        printf 'mockpkg1.x86_64    1.1-1.el8    mockrepo\nmockpkg2.x86_64    2.1-1.el8    mockrepo\n'
+        exit 100
+    fi
     if printf '%s' ",${MOCK_PCT_FAIL_VMS:-}," | grep -q ",$vmid,"; then
         echo "E: apt-get update failed (mock)" >&2
         exit 100

@@ -1,5 +1,32 @@
 # Changelog
 
+## v3.5.0 (Phase 1 — stable engine interfaces for the GUI backend)
+- **New:** `--scan` — read-only update scan with package preview (FR-002/FR-007).
+  Guests: apt-tagged run `apt-get update -qq` (index refresh only) + `apt-get -s upgrade`;
+  yum-tagged run `dnf/yum check-update` (rc 100 = updates available, other rc = failed —
+  never success). Host: `--host --scan` runs `apt-get update` + `apt-get -s dist-upgrade`.
+  No package state is changed anywhere; verified by call-log assertions (no `-y`,
+  no `dist-upgrade` install calls). Requires root (execs into guests). Combines with
+  `--host`/`--only`/`--exclude`/`--report`; rejected with `--list/--check/--backup-status`.
+- **New:** report gains per-guest `packages` array (max 200 names) and reason
+  "N updates available"/"up to date" in scan modes (`mode: "scan"` / `"host-scan"`).
+  Existing update reports keep the same shape; `packages: []` added.
+- **New:** `--backup-status` — machine-readable JSON on stdout (logs go to stderr):
+  `backup_status: ok|unknown`, `enabled_backup_jobs`, per-candidate `backup_covered`
+  (FR-009/FR-010 groundwork). Unknown job list never reports covered.
+- **New:** per-target locks (FR-014): `TARGET_LOCK_DIR` (default `/var/lock`), file
+  `update-vms-<type>-<vmid>.lock` held during guest exec and host scan. A target held
+  by another process is *skipped* with reason "target locked by another run" — never
+  queued, never double-run. The global `LOCK_FILE` guard is unchanged.
+- **Preflight:** `TARGET_LOCK_DIR` must exist and be writable (exit 2 otherwise).
+- **Tests:** 15 new cases (78 total, all passing): host scan packages/fail/current,
+  guest scan apt/yum/current/fail, scan no-agent skip, scan+update target-lock skip,
+  backup-status JSON ok/unknown, scan non-root refusal, mode conflicts, report
+  packages backward-compat. New mock knobs: `MOCK_PCT_SCAN_MODE`, `MOCK_PCT_YUM_SCAN`,
+  `MOCK_QM_SCAN_MODE`, `MOCK_APT_SCAN_MODE`; `run_script_stdout` for JSON modes.
+- **Unchanged:** all v3.4 CLI behaviour, exit codes (0/1/2/3), status model, summary
+  line format. All 63 pre-existing tests pass without modification.
+
 ## v3.4.0 deployed (2026-10-15)
 - Deployed to `prod-node:/root/update-vms.sh` (v2 kept as `update-vms.sh.v2.bak`).
 - Trigger: v2 silently ignored unknown flags — running `--help` on v2 executed a real update pass. v3.4 rejects unknown args (exit 2) and has a tested `--help` path (test 61).
