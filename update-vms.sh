@@ -8,6 +8,13 @@
 #   yum     -> dnf -y update if present, else yum -y update
 #   windows -> skipped
 #
+# v3.3 (B6) adds reporting (FR-006, FR-013):
+#   --report <path>    write a JSON report (per-guest status/reason/duration,
+#                      summary, mode, timings) after the run
+#   --log-file <path>  append timestamped log lines to a file
+#   Per-guest status model: success | warning | skipped | failed (update runs),
+#   planned (dry-run/list/check). Summary line gains "(N with warnings)".
+#
 # v3.2 (B5) adds safety preflight (FR-007/010, SEC-009):
 #   - Guest Agent preflight for QEMU update candidates: no agent -> skipped
 #     with an explicit reason, never reported as success.
@@ -60,7 +67,7 @@
 #
 set -u -o pipefail
 
-VERSION="3.2.0"
+VERSION="3.3.0"
 EXIT_OK=0
 EXIT_GUEST_FAILURE=1
 EXIT_PREFLIGHT=2
@@ -79,8 +86,31 @@ LIST=0
 CHECK=0
 ONLY=""
 EXCLUDE=""
+REPORT_PATH="${REPORT_PATH:-}"
+LOG_FILE_PATH="${LOG_FILE_PATH:-}"
 
-log() { echo "[$(date '+%F %T')] $*"; }
+RUN_START=$SECONDS
+STARTED=$(date '+%F %T')
+GUESTS_FILE=$(mktemp) || { echo "error: cannot create temp file" >&2; exit "$EXIT_PREFLIGHT"; }
+trap 'rm -f "$GUESTS_FILE"' EXIT
+
+log() {
+    local line
+    line="[$(date '+%F %T')] $*"
+    echo "$line"
+    if [ -n "$LOG_FILE_PATH" ]; then
+        if ! printf '%s\n' "$line" >> "$LOG_FILE_PATH"; then
+            echo "error: cannot write log file: $LOG_FILE_PATH" >&2
+        fi
+    fi
+}
+
+# Per-guest record (TSV -> JSON at report time). Reason is tab-sanitized.
+record_guest() {
+    # record_guest <vmid> <type> <name> <action> <status> <reason> <duration_s>
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$1" "$2" "${3//$'\t'/ }" "$4" "$5" "${6//$'\t'/ }" "$7" >> "$GUESTS_FILE"
+}
 
 usage() {
     cat >&2 <<EOF
@@ -92,6 +122,8 @@ usage: $(basename "$0") [options]
   --version        print version and exit
   --only <ids>     only these VMIDs (comma-separated, numeric)
   --exclude <ids>  skip these VMIDs (comma-separated, numeric)
+  --report <path>  write JSON report to path after the run (v3.3)
+  --log-file <p>   also append log lines to file (v3.3)
   -h, --help       this help
 safety env: MIN_GUEST_FREE_MB (default 500), DISK_CHECK/AGENT_CHECK/BACKUP_CHECK (1|0)
 exit codes: 0 ok | 1 guest failure(s) | 2 preflight/usage | 3 lock busy
@@ -119,6 +151,12 @@ while [ $# -gt 0 ]; do
         --exclude)
             require_value --exclude $#; EXCLUDE="$2"; shift ;;
         --exclude=*) EXCLUDE="${1#--exclude=}" ;;
+        --report)
+            require_value --report $#; REPORT_PATH="$2"; shift ;;
+        --report=*)    REPORT_PATH="${1#--report=}" ;;
+        --log-file)
+            require_value --log-file $#; LOG_FILE_PATH="$2"; shift ;;
+        --log-file=*)  LOG_FILE_PATH="${1#--log-file=}" ;;
         -h|--help) usage; exit "$EXIT_OK" ;;
         *) echo "error: unknown argument: $1" >&2; usage; exit "$EXIT_PREFLIGHT" ;;
     esac
@@ -167,6 +205,19 @@ for flag in DISK_CHECK AGENT_CHECK BACKUP_CHECK; do
         *) log "preflight: $flag must be 0 or 1 (got: ${!flag})"; exit "$EXIT_PREFLIGHT" ;;
     esac
 done
+
+# report/log output paths must be writable (fail before doing any work)
+if [ -n "$LOG_FILE_PATH" ] && ! touch "$LOG_FILE_PATH" 2>/dev/null; then
+    log "preflight: cannot write log file: $LOG_FILE_PATH"
+    exit "$EXIT_PREFLIGHT"
+fi
+if [ -n "$REPORT_PATH" ]; then
+    report_dir=$(dirname "$REPORT_PATH")
+    if [ ! -d "$report_dir" ] || [ ! -w "$report_dir" ]; then
+        log "preflight: report path not writable: $REPORT_PATH"
+        exit "$EXIT_PREFLIGHT"
+    fi
+fi
 
 for bin in jq pvesh pct qm flock timeout; do
     if ! command -v "$bin" >/dev/null 2>&1; then
@@ -257,7 +308,34 @@ check_guest_disk() {
     return 1
 }
 
-OK=0; FAIL=0; SKIP=0
+# JSON report (FR-013). Built with jq only - no hand-concatenated JSON.
+write_report() {
+    local mode_kind="$1" finished total summary guests
+    finished=$(date '+%F %T')
+    total=$((SECONDS - RUN_START))
+    summary=$(jq -n --argjson s "$OK" --argjson w "$WARN" --argjson k "$SKIP" --argjson f "$FAIL" \
+        '{success:$s, warning:$w, skipped:$k, failed:$f}')
+    guests=$(jq -R -s -c '
+        split("\n") | map(select(length > 0)) | map(split("\t") |
+        (.[0] as $id | .[6] as $dur |
+        { vmid: ($id | tonumber? // $id),
+          type: .[1], name: .[2], action: .[3],
+          status: .[4], reason: .[5],
+          duration_s: ($dur | tonumber? // 0) }))' "$GUESTS_FILE")
+    if ! jq -n --arg tool "update-vms" --arg version "$VERSION" --arg node "$NODE" \
+            --arg mode "$mode_kind" --arg started "$STARTED" --arg finished "$finished" \
+            --argjson duration_s "$total" --argjson summary "$summary" --argjson guests "$guests" \
+        '{tool:$tool, version:$version, node:$node, mode:$mode,
+          started:$started, finished:$finished, duration_s:$duration_s,
+          summary:$summary, guests:$guests}' > "$REPORT_PATH"; then
+        log "error: cannot write report: $REPORT_PATH"
+        return "$EXIT_PREFLIGHT"
+    fi
+    log "report written: $REPORT_PATH"
+    return 0
+}
+
+OK=0; WARN=0; FAIL=0; SKIP=0
 
 run_guest_cmd() {
     # run_guest_cmd <type> <vmid> <shell-command>
@@ -347,6 +425,7 @@ if [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ]; then
         if [ "$LIST" -eq 1 ]; then
             printf '%-8s %-5s %-8s %-24s %s\n' "$VMID" "$TYPE" "$STATUS" "${TAGS:--}" "$NAME [$ACTION]"
         fi
+        record_guest "$VMID" "$TYPE" "$NAME" "$ACTION" "planned" "" 0
     done < <(printf '%s' "$resources" | jq -c --arg node "$NODE" '.[] | select(.node == $node)')
     if [ "$CHECK" -eq 1 ]; then
         for action in "${!ACTION_COUNT[@]}"; do
@@ -355,6 +434,13 @@ if [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ]; then
         log "  update candidates without guest agent: $NOAGENT"
         log "  update candidates not covered by an enabled backup job: $NOTCOVERED"
         log "preflight ok: root, binaries, env, inventory"
+    fi
+    if [ -n "$REPORT_PATH" ]; then
+        if [ "$CHECK" -eq 1 ]; then
+            write_report "check"
+        else
+            write_report "list"
+        fi
     fi
     exit "$EXIT_OK"
 fi
@@ -383,29 +469,37 @@ while IFS= read -r VM; do
     TYPE=$(printf '%s' "$VM" | jq -r '.type')
     STATUS=$(printf '%s' "$VM" | jq -r '.status')
     TAGS=$(printf '%s' "$VM" | jq -r '.tags // ""')
+    NAME=$(printf '%s' "$VM" | jq -r '.name // ""')
+    gstart=$SECONDS
+    GUEST_WARN=0
 
     if ! [[ "$VMID" =~ ^[0-9]+$ ]]; then
         log "⚠ Skipping malformed entry (vmid=$VMID)"
+        record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "malformed entry" 0
         SKIP=$((SKIP+1)); continue
     fi
 
     if [ -n "$ONLY" ] && ! in_list "$ONLY" "$VMID"; then
         log "⏭ Skipping $VMID ($TYPE) - not in --only list"
+        record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "not in --only list" 0
         SKIP=$((SKIP+1)); continue
     fi
     if [ -n "$EXCLUDE" ] && in_list "$EXCLUDE" "$VMID"; then
         log "⏭ Skipping $VMID ($TYPE) - in --exclude list"
+        record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "in --exclude list" 0
         SKIP=$((SKIP+1)); continue
     fi
     ONLY_FOUND="$ONLY_FOUND$VMID,"
 
     if [ "$STATUS" != "running" ]; then
         log "⚪ Skipping $VMID ($TYPE) - status $STATUS"
+        record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "status $STATUS" 0
         SKIP=$((SKIP+1)); continue
     fi
 
     if has_tag "$TAGS" "windows"; then
         log "🟦 Skipping $VMID ($TYPE) - tag: windows"
+        record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "tag: windows" 0
         SKIP=$((SKIP+1)); continue
     fi
 
@@ -417,12 +511,14 @@ while IFS= read -r VM; do
         UPDATE_CMD="$APT_CMD"; UPDATE_KIND="apt"
     else
         log "⚠ Skipping $VMID ($TYPE) - no apt/yum/windows tag (tags: ${TAGS:-none})"
+        record_guest "$VMID" "$TYPE" "$NAME" "-" skipped "no apt/yum/windows tag" 0
         SKIP=$((SKIP+1)); continue
     fi
 
     # ---- B5 safety preflight per update candidate ------------------------
     if [ "$AGENT_CHECK" -eq 1 ] && [ "$TYPE" = "qemu" ] && ! guest_has_agent "$VMID"; then
         log "⏭ Skipping $VMID (qemu) - no guest agent (install qemu-guest-agent in the guest and run: qm set $VMID -agent enabled=1)"
+        record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" skipped "no guest agent" 0
         SKIP=$((SKIP+1)); continue
     fi
 
@@ -431,22 +527,38 @@ while IFS= read -r VM; do
         check_guest_disk "$TYPE" "$VMID" || drc=$?
         if [ "$drc" -eq 1 ]; then
             log "⏭ Skipping $VMID ($TYPE) - insufficient disk space (<${MIN_GUEST_FREE_MB} MB free on /)"
+            record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" skipped "insufficient disk space" 0
             SKIP=$((SKIP+1)); continue
         elif [ "$drc" -eq 2 ]; then
             log "⏭ Skipping $VMID ($TYPE) - disk space check failed (unknown prerequisites, SEC-009)"
+            record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" skipped "disk check failed" 0
             SKIP=$((SKIP+1)); continue
         fi
     fi
 
     if [ "$BACKUP_CHECK" -eq 1 ] && [ "$BACKUP_STATUS" = "ok" ] && ! backup_covers "$VMID"; then
         log "⚠ $VMID ($TYPE): not covered by any enabled backup job (FR-010)"
+        GUEST_WARN=1
     fi
 
     log "▶ Updating $VMID ($TYPE) [$UPDATE_KIND]"
+    gdur=0
     if run_guest_cmd "$TYPE" "$VMID" "$UPDATE_CMD"; then
-        OK=$((OK+1))
+        gdur=$((SECONDS-gstart))
+        if [ "$DRY_RUN" -eq 1 ]; then
+            record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" planned "dry-run preview" "$gdur"
+            OK=$((OK+1))
+        elif [ "$GUEST_WARN" -eq 1 ]; then
+            WARN=$((WARN+1))
+            record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" warning "updated with warnings" "$gdur"
+        else
+            OK=$((OK+1))
+            record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" success "" "$gdur"
+        fi
     else
+        gdur=$((SECONDS-gstart))
         FAIL=$((FAIL+1))
+        record_guest "$VMID" "$TYPE" "$NAME" "$UPDATE_KIND" failed "update command failed" "$gdur"
     fi
 done < <(printf '%s' "$resources" | jq -c --arg node "$NODE" '.[] | select(.node == $node)')
 
@@ -461,8 +573,24 @@ if [ -n "$ONLY" ]; then
     done
 fi
 
-log "=== done: $OK updated, $FAIL failed, $SKIP skipped ==="
-if [ "$FAIL" -gt 0 ]; then
-    exit "$EXIT_GUEST_FAILURE"
+updated_total=$((OK+WARN))
+extra=""
+[ "$WARN" -gt 0 ] && extra=" ($WARN with warnings)"
+log "=== done: $updated_total updated, $FAIL failed, $SKIP skipped$extra ==="
+
+log "=== per-guest results ==="
+while IFS=$'\t' read -r g_vmid g_type g_name g_action g_status g_reason g_dur; do
+    [ -n "$g_vmid" ] || continue
+    log "  $g_vmid $g_type $g_name [$g_action] $g_status ${g_dur}s${g_reason:+ - $g_reason}"
+done < "$GUESTS_FILE"
+
+rc="$EXIT_OK"
+[ "$FAIL" -gt 0 ] && rc="$EXIT_GUEST_FAILURE"
+if [ -n "$REPORT_PATH" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        write_report "dry-run" || rc="$EXIT_PREFLIGHT"
+    else
+        write_report "update" || rc="$EXIT_PREFLIGHT"
+    fi
 fi
-exit "$EXIT_OK"
+exit "$rc"

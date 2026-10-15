@@ -39,6 +39,7 @@ reset_env() {
     unset PCT_EXEC_TIMEOUT QEMU_EXEC_TIMEOUT MOCK_PVESH_FIXTURE
     unset MOCK_GUEST_DF MOCK_BACKUP_FIXTURE MIN_GUEST_FREE_MB
     unset DISK_CHECK AGENT_CHECK BACKUP_CHECK
+    unset REPORT_PATH LOG_FILE_PATH
     OUT=""; RC=0
 }
 
@@ -404,6 +405,78 @@ test_agent_check_disabled_fails_via_exec() {
     AGENT_CHECK=0 MOCK_QM_AGENT_DOWN_VMS=102 run_script
     assert_rc 1
     assert_log "1 failed"
+}
+
+# 41. --report writes valid JSON with all node guests and correct summary.
+test_report_json_valid() {
+    run_script --report "$T_DIR/report.json"
+    assert_rc 0
+    jq -e . "$T_DIR/report.json" >/dev/null || fail "report not valid JSON"
+    local n s
+    n=$(jq '.guests | length' "$T_DIR/report.json")
+    [ "$n" -eq 8 ] || fail "expected 8 guests in report, got $n"
+    s=$(jq -r '.summary.success' "$T_DIR/report.json")
+    [ "$s" -eq 3 ] || fail "summary.success=$s expected 3"
+    [ "$(jq -r '.mode' "$T_DIR/report.json")" = "update" ] || fail "mode wrong"
+    grep -qiE 'password|token=|secret' "$T_DIR/report.json" && fail "secret-like content in report"
+}
+
+# 42. Report marks the failing guest failed and counts it.
+test_report_reflects_failure() {
+    MOCK_PCT_FAIL_VMS=111 run_script --report "$T_DIR/r.json"
+    assert_rc 1
+    [ "$(jq -r '.summary.failed' "$T_DIR/r.json")" -eq 1 ] || fail "summary.failed != 1"
+    [ "$(jq -r '.guests[] | select(.vmid==111) | .status' "$T_DIR/r.json")" = "failed" ] || fail "111 not failed"
+}
+
+# 43. Backup warning -> guest status "warning", visible in summary and line.
+test_warning_status() {
+    MOCK_BACKUP_FIXTURE="$FIXTURES/jobs_partial.json" run_script --report "$T_DIR/r.json"
+    assert_rc 0
+    [ "$(jq -r '.summary.warning' "$T_DIR/r.json")" -eq 1 ] || fail "summary.warning != 1"
+    [ "$(jq -r '.guests[] | select(.vmid==102) | .status' "$T_DIR/r.json")" = "warning" ] || fail "102 not warning"
+    assert_log "1 with warnings"
+}
+
+# 44. --log-file receives the timestamped log.
+test_log_file_written() {
+    run_script --log-file "$T_DIR/run.log"
+    assert_rc 0
+    [ -s "$T_DIR/run.log" ] || fail "log file empty"
+    grep -q "done:" "$T_DIR/run.log" || fail "log file missing summary line"
+}
+
+# 45. Unwritable log/report paths fail in preflight (before any work).
+test_log_file_unwritable() {
+    run_script --log-file "$T_DIR/nodir/run.log"
+    assert_rc 2
+    assert_log "cannot write log file"
+    assert_calls_not "pct exec"
+}
+test_report_path_unwritable() {
+    run_script --report "$T_DIR/nodir/r.json"
+    assert_rc 2
+    assert_log "report path not writable"
+    assert_calls_not "pct exec"
+}
+
+# 46. dry-run report: mode dry-run, candidates planned, no exec calls.
+test_dry_run_report() {
+    run_script --dry-run --report "$T_DIR/r.json"
+    assert_rc 0
+    [ "$(jq -r '.mode' "$T_DIR/r.json")" = "dry-run" ] || fail "mode not dry-run"
+    [ "$(jq '[.guests[] | select(.status=="planned")] | length' "$T_DIR/r.json")" -eq 3 ] || fail "planned != 3"
+    assert_calls_not "pct exec"
+    assert_calls_not "qm guest exec"
+}
+
+# 47. check-mode report: mode check, all guests planned.
+test_check_report() {
+    run_script --check --report "$T_DIR/r.json"
+    assert_rc 0
+    [ "$(jq -r '.mode' "$T_DIR/r.json")" = "check" ] || fail "mode not check"
+    [ "$(jq '.guests | length' "$T_DIR/r.json")" -eq 8 ] || fail "guests != 8"
+    [ "$(jq '[.guests[] | select(.status=="planned")] | length' "$T_DIR/r.json")" -eq 8 ] || fail "not all planned"
 }
 
 # ---- run -----------------------------------------------------------------

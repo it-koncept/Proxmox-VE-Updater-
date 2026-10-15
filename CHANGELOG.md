@@ -1,5 +1,13 @@
 # Changelog
 
+## v3.3 (reporting, Fase B B6)
+- **New:** `--report <path>` writes a JSON report after the run: tool/version/node/mode, start/finish/duration, `summary` (success/warning/skipped/failed) and a `guests` array with per-guest `vmid, type, name, action, status, reason, duration_s` (FR-013). Built with jq only — no hand-concatenated JSON; unwritable path fails in preflight (exit 2) before any work.
+- **New:** `--log-file <path>` appends every timestamped log line to a file (FR-006); unwritable path fails in preflight.
+- **New:** per-guest status model: `success | warning | skipped | failed` for update runs, `planned` for dry-run/list/check. A guest updated despite a backup-coverage warning ends as `warning`, not `success`.
+- **New:** end-of-run per-guest results table in the log; summary line now shows `(N with warnings)` when warnings occurred (existing `N updated, F failed, S skipped` prefix preserved).
+- **Tests:** 7 new cases (48 total, all passing): report validity/completeness/summary, failure reflected, warning status, log-file content, unwritable log/report paths rejected pre-run, dry-run and check report modes. Two real bugs caught and fixed: jq `tonumber? // .[0]` indexed a string after the pipe (report crashed on malformed entries), and a test-side quoting bug (`\"` inside single quotes).
+- Verified live on prod-node with `--dry-run --report --log-file` (read-only): 16 guests reported, 102/104 correctly `skipped - no guest agent`, valid JSON, files removed after.
+
 ## v3.2 (safety preflight, Fase B B5)
 - **New:** QEMU Guest Agent preflight — update candidates are checked via `pvesh get /nodes/<node>/qemu/<id>/agent` before any exec; no/unresponsive agent -> guest **skipped** with an explicit fix hint (`qm set <id> -agent enabled=1`), never reported as success. Disable with `AGENT_CHECK=0` (then the exec path fails as before).
 - **New:** guest disk-space preflight — `df -P -k /` inside the guest; free space below `MIN_GUEST_FREE_MB` (default 500) or a failed/unparseable check -> guest skipped with a warning (SEC-009: unknown prerequisites are never treated as ready). Skipped in `--dry-run` (keeps dry-run free of guest exec). Disable with `DISK_CHECK=0`.

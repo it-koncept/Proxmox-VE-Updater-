@@ -95,6 +95,18 @@ Target specific guests (v3.1):
 ./update-vms.sh --dry-run --only 107      # filters combine with dry-run
 ```
 
+Reporting (v3.3):
+
+```bash
+./update-vms.sh --report /var/log/update-vms/report.json \
+                --log-file /var/log/update-vms/run.log
+```
+
+`--report` writes a JSON document (mode, timings, summary, and per-guest
+`status`/`reason`/`duration_s`; statuses: `success`, `warning`, `skipped`,
+`failed`, or `planned` in dry-run/list/check). `--log-file` appends the
+timestamped log. Unwritable paths fail in preflight before any work starts.
+
 Run manually:
 
 ```bash
