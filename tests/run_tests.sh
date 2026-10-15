@@ -592,6 +592,18 @@ test_host_requires_root() {
     assert_calls_not "apt-get update"
 }
 
+# 60. systemd unit files parse cleanly (ExecStart rewritten to the real
+# script path so verify can stat it). Skipped when systemd-analyze is absent.
+test_systemd_units_valid() {
+    command -v systemd-analyze >/dev/null 2>&1 || { echo "  (skipped: no systemd-analyze)"; return 0; }
+    sed "s|/usr/local/bin/update-vms.sh|$SCRIPT|" \
+        "$REPO_DIR/contrib/systemd/update-vms.service" > "$T_DIR/update-vms.service" || fail "sed failed"
+    cp "$REPO_DIR/contrib/systemd/update-vms.timer" "$T_DIR/update-vms.timer"
+    local out
+    out=$(cd "$T_DIR" && systemd-analyze verify update-vms.service update-vms.timer 2>&1)
+    [ -z "$out" ] || fail "systemd-analyze verify: $out"
+}
+
 # ---- run -----------------------------------------------------------------
 for fn in $(declare -F | awk '$3 ~ /^test_/ {print $3}'); do
     t "${fn#test_}" "$fn"

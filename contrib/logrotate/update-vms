@@ -1,0 +1,12 @@
+# Logrotate snippet for update-vms log/report files.
+# Install to /etc/logrotate.d/update-vms (only needed if --log-file is used;
+# journal output is rotated by journald itself).
+/var/log/update-vms/run.log /var/log/update-vms/report.json {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+}

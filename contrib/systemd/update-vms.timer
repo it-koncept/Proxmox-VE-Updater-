@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly scheduled run of update-vms.service
+
+[Timer]
+# Sunday 03:30 with up to 10 min jitter; catches up if the host was down.
+OnCalendar=Sun *-*-* 03:30:00
+RandomizedDelaySec=600
+Persistent=true
+Unit=update-vms.service
+
+[Install]
+WantedBy=timers.target

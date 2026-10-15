@@ -120,6 +120,32 @@ quorum is lost or host `/` free space is below `MIN_HOST_FREE_MB` (default
 1000), and aborts before dist-upgrade if `apt-get update` fails. A detected
 reboot requirement is reported as a warning — the tool never reboots.
 
+## Scheduled operation (optional, v3.4)
+
+`contrib/systemd/` ships a oneshot service + weekly timer (Sunday 03:30,
+jittered, `Persistent=true` catches up after downtime). **Nothing is
+installed automatically** — deploying is a deliberate decision:
+
+```bash
+install -m 0755 update-vms.sh /usr/local/bin/update-vms.sh
+install -m 0644 contrib/systemd/env.update-vms /etc/default/update-vms   # EDIT FIRST
+install -m 0644 contrib/systemd/update-vms.service /etc/systemd/system/
+install -m 0644 contrib/systemd/update-vms.timer  /etc/systemd/system/
+systemctl daemon-reload
+systemctl start update-vms.service      # test once (shipped default is --dry-run)
+journalctl -u update-vms.service -b
+systemctl enable --now update-vms.timer # only after you approved the options
+```
+
+The shipped `/etc/default/update-vms` default is `PVU_OPTIONS=--dry-run`;
+switch it to a real run (with `--report`/`--log-file`) only when you have
+reviewed the dry-run output. Never put `--host` in a timer-driven run
+without a separate explicit policy decision (SEC-001).
+
+Log rotation for `--log-file`/`--report` output: `contrib/logrotate/update-vms`
+(install to `/etc/logrotate.d/update-vms`). Journal output needs nothing —
+journald rotates itself.
+
 Run manually:
 
 ```bash

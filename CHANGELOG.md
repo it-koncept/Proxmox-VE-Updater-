@@ -1,5 +1,11 @@
 # Changelog
 
+## v3.4 contrib (scheduled operation, Fase B B8)
+- **New:** `contrib/systemd/update-vms.service` (oneshot, Nice=19, idle IO, NoNewPrivileges, PrivateTmp) + `update-vms.timer` (Sun 03:30, 10 min jitter, Persistent). Options via `/etc/default/update-vms`; shipped default `--dry-run` — a real run is a deliberate local edit. `--host` must never enter a timer run without separate policy (SEC-001).
+- **New:** `contrib/logrotate/update-vms` for `--log-file`/`--report` output.
+- **Docs:** README "Scheduled operation" section with exact install steps; nothing is installed automatically.
+- **Tests:** new case validates unit files with `systemd-analyze verify` (skipped if absent). 62 total.
+
 ## v3.4 (host updates, Fase B B7)
 - **New:** `--host` updates the PVE host itself: `apt-get update` then `apt-get -y dist-upgrade` (noninteractive, keeps conffiles), each phase bounded by `HOST_UPDATE_TIMEOUT` (default 3600 s).
 - **Policy gate (SEC-001):** a real host run requires typing `YES` at an interactive prompt; with no tty (cron/timer/ssh non-interactive) it refuses with exit 2 unless `--yes` is given explicitly. Never automatic.

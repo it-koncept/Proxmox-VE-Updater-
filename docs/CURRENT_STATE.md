@@ -80,3 +80,23 @@ CLI fra SPEC §6 (`--check --list --report --host --guests --all --test --versio
 ## 7. Konklusion
 
 Deployet kode = repo-HEAD = v2. Basis-gæsteopdatering virker for LXC/apt; QEMU-delen er død på denne fleet pga. manglende Guest Agent. Hele P1/P2-sættet (rapport, backup-tjek, preflight, validering, tests, CLI-omfang) mangler. Største strukturelle brist: ingen tests overhovedet og ingen adskillelse af kommandoafvikling fra logik.
+
+## 8. Status efter Fase B (opdateret 2026-10-15)
+
+Fase B (B1–B8) er gennemført på branch `feat/fase-b-hardening` (ikke pushet, ikke deployet):
+
+| Fase | Levering | Commit |
+|---|---|---|
+| B1 | Dokumenter i git + CURRENT_STATE | `59b52d2` |
+| B2 | Mock-testsuite (PATH-shadowing, call-log) | `a46f95c` |
+| B3 | v3-hårdning: preflight, pvesh-fejl, timeout, exitkoder | `5335d33` |
+| B4 | v3.1 CLI: `--version/--list/--check/--only/--exclude` | `f4559a1` |
+| B5 | v3.2 sikkerheds-præflight: disk, agent, backup-dækning | `c44c9a3` |
+| B6 | v3.3 JSON-rapport, logfil, statusmodel | `49f09fc` |
+| B7 | v3.4 `--host` med politik-gates + kvorum-fix | `3c71ae8`, `7cb835c` |
+| B8 | systemd service/timer + logrotate + driftsdok | denne commit |
+
+Tests: 62/62 bestået (mock-baseret), ShellCheck ren, `systemd-analyze verify` grön.
+Live-verifikation på prod-node kun read-only (dry-run/list/check/report); deployede
+`/root/update-vms.sh` er stadig v2 (md5 `eee67b2574231ac59b4b9465a7882608`).
+Resterende beslutninger: push til GitHub, deploy af v3.4 på prod-node, evt. QEMU-agenter.

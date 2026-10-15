@@ -1,0 +1,22 @@
+[Unit]
+Description=Update tagged Proxmox guests (update-vms.sh)
+Documentation=file:/usr/local/share/doc/update-vms/README.md
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Options come from /etc/default/update-vms (PVU_OPTIONS). The shipped
+# default is --dry-run; a real run is a deliberate local decision.
+Environment=PVU_OPTIONS=--dry-run
+EnvironmentFile=-/etc/default/update-vms
+ExecStart=/usr/local/bin/update-vms.sh ${PVU_OPTIONS}
+Nice=19
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
