@@ -103,6 +103,31 @@ crontab -e
 | `--dry-run`         | off       | Print what would run, change nothing      |
 | `PVE_NODE`          | hostname  | Only update guests on this node           |
 | `QEMU_EXEC_TIMEOUT` | 1800      | `qm guest exec --timeout` in seconds      |
+| `PCT_EXEC_TIMEOUT`  | 1800      | `timeout` wrapper around `pct exec` (v3)  |
+| `LOCK_FILE`         | `/var/lock/update-vms.lock` | Single-instance lock path (v3)          |
+
+### Exit codes (v3)
+
+| Code | Meaning |
+|------|---------|
+| 0    | Success (all touched guests ok; skips are fine) |
+| 1    | One or more guests failed |
+| 2    | Preflight/usage error (not root, bad args/env, pvesh failure, missing binary) |
+| 3    | Another run holds the lock |
+
+Preflight (v3): real runs require root; `--dry-run` works as non-root. `pvesh`
+failure or non-JSON output aborts with exit 2 — it is never reported as an
+empty success.
+
+### Running the tests (v3)
+
+```bash
+./tests/run_tests.sh
+```
+
+Mock-based: real `pvesh`/`pct`/`qm`/`id` are shadowed by `tests/mocks/` via
+`PATH`, and every mock call is logged so tests can prove no real system
+command was reached. Never run the suite against real guests.
 
 > **Why the timeout matters:** `qm guest exec` defaults to **30 seconds**, which kills
 > long package installs mid-run and can leave dpkg/rpm in a broken state. This script
