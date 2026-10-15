@@ -37,6 +37,7 @@ reset_env() {
     export MOCK_QM_AGENT_DOWN_VMS="" MOCK_QM_RC=0
     export MOCK_GUEST_DF_FAIL_VMS="" MOCK_BACKUP_FAIL=0
     export MOCK_APT_UPDATE_FAIL=0 MOCK_APT_DIST_FAIL=0 MOCK_PVECM_MODE=standalone
+    unset MOCK_PVECM_FIXTURE
     unset PCT_EXEC_TIMEOUT QEMU_EXEC_TIMEOUT MOCK_PVESH_FIXTURE
     unset MOCK_GUEST_DF MOCK_BACKUP_FIXTURE MIN_GUEST_FREE_MB
     unset DISK_CHECK AGENT_CHECK BACKUP_CHECK
@@ -536,6 +537,15 @@ test_host_quorate_ok() {
     MOCK_PVECM_MODE=quorate run_script --host --yes
     assert_rc 0
     assert_log "quorum ok"
+}
+
+# 54b. Real pvecm status output format must parse (regression: field is
+# 'Quorate: Yes', not 'Quorum: Yes').
+test_host_quorum_real_output() {
+    MOCK_PVECM_FIXTURE="$FIXTURES/pvecm_real.txt" run_script --host --yes
+    assert_rc 0
+    assert_log "quorum ok"
+    assert_calls "apt-get update"
 }
 
 # 55. Low host disk space refuses the update.

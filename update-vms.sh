@@ -381,7 +381,7 @@ host_quorum_ok() {
         printf '%s\n' "$out" | head -3 | sed 's/^/   | /'
         return 1
     fi
-    if printf '%s' "$out" | grep -q "Quorum: Yes"; then
+    if printf '%s' "$out" | grep -qE "^Quorate:[[:space:]]+Yes"; then
         log "host: cluster quorum ok"
         return 0
     fi

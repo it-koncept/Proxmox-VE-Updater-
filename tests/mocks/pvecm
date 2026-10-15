@@ -1,13 +1,18 @@
 #!/bin/bash
 # Mock pvecm for tests. MOCK_PVECM_MODE: standalone|quorate|noquorum.
+# MOCK_PVECM_FIXTURE: cat this file instead (real pvecm output regression).
 echo "pvecm $*" >> "$MOCK_CALLS"
+if [ -n "${MOCK_PVECM_FIXTURE:-}" ]; then
+    cat "$MOCK_PVECM_FIXTURE"
+    exit 0
+fi
 case "${MOCK_PVECM_MODE:-standalone}" in
     quorate)
-        echo "Quorum: Yes"
+        echo "Quorate: Yes"
         exit 0
         ;;
     noquorum)
-        echo "Quorum: No"
+        echo "Quorate: No"
         exit 0
         ;;
     *)
