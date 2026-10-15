@@ -238,14 +238,14 @@ guests.
 [2026-10-15 03:00:01] === update-vms start (node=prod-node) ===
 [2026-10-15 03:00:02] ▶ Updating 107 (lxc) [apt]
 [2026-10-15 03:01:10] ▶ Updating 101 (qemu) [yum/dnf]
-[2026-10-15 03:01:45] 🟦 Skipping 102 (qemu) - Guest Agent not available (qm set 102 -agent enabled=1)
+[2026-10-15 03:01:45] ⏭ Skipping 102 (qemu) - no guest agent (install qemu-guest-agent in the guest and run: qm set 102 -agent enabled=1)
 [2026-10-15 03:01:45] 🟦 Skipping 150 (qemu) - tag: windows
 [2026-10-15 03:01:45] ⚪ Skipping 149 (lxc) - status stopped
 [2026-10-15 03:02:00] === done: 2 updated, 0 failed, 3 skipped (0 with warnings) ===
 [2026-10-15 03:02:00] === per-guest results ===
 [2026-10-15 03:02:00]   107 lxc web01 [apt] success 68s
 [2026-10-15 03:02:00]   101 qemu db01 [yum/dnf] success 35s
-[2026-10-15 03:02:00]   102 qemu mail01 [none] skipped 0s - Guest Agent not available (qm set 102 -agent enabled=1)
+[2026-10-15 03:02:00]   102 qemu mail01 [yum/dnf] skipped 0s - no guest agent
 ```
 
 ---
