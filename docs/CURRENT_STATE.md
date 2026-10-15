@@ -96,7 +96,12 @@ Fase B (B1–B8) er gennemført på branch `feat/fase-b-hardening` (ikke pushet,
 | B7 | v3.4 `--host` med politik-gates + kvorum-fix | `3c71ae8`, `7cb835c` |
 | B8 | systemd service/timer + logrotate + driftsdok | denne commit |
 
-Tests: 62/62 bestået (mock-baseret), ShellCheck ren, `systemd-analyze verify` grön.
-Live-verifikation på prod-node kun read-only (dry-run/list/check/report); deployede
-`/root/update-vms.sh` er stadig v2 (md5 `eee67b2574231ac59b4b9465a7882608`).
-Resterende beslutninger: push til GitHub, deploy af v3.4 på prod-node, evt. QEMU-agenter.
+Tests: 63/63 bestået (mock-baseret), ShellCheck ren, `systemd-analyze verify` grön.
+**Deployet 2026-10-15:** `prod-node:/root/update-vms.sh` = v3.4.0 (v2 backup:
+`/root/update-vms.sh.v2.bak`, md5 `eee67b2574231ac59b4b9465a7882608`).
+Deploy-anledning: v2 ignorerede ukendte flags — `--help` på v2 udløste en
+**faktisk opdateringskørsel** på prod-node (107/157/159 opgraderet, alle rene
+bagefter; CT 141 halvsønder af ældre afbrudt dist-upgrade (bullseye→trixie),
+repareret ved at færdiggøre dist-upgraden, godkendt af bruger).
+Resterende beslutninger: push til GitHub, evt. QEMU-agenter, CT 122/123
+(Debian 9 stretch EOL — kan ikke opgraderes som de er).

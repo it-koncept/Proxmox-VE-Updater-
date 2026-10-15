@@ -1,5 +1,10 @@
 # Changelog
 
+## v3.4.0 deployed (2026-10-15)
+- Deployed to `prod-node:/root/update-vms.sh` (v2 kept as `update-vms.sh.v2.bak`).
+- Trigger: v2 silently ignored unknown flags — running `--help` on v2 executed a real update pass. v3.4 rejects unknown args (exit 2) and has a tested `--help` path (test 61).
+- usage text now lists host env vars (HOST_UPDATE_TIMEOUT, MIN_HOST_FREE_MB, HOST_REBOOT_MARKER).
+
 ## v3.4 contrib (scheduled operation, Fase B B8)
 - **New:** `contrib/systemd/update-vms.service` (oneshot, Nice=19, idle IO, NoNewPrivileges, PrivateTmp) + `update-vms.timer` (Sun 03:30, 10 min jitter, Persistent). Options via `/etc/default/update-vms`; shipped default `--dry-run` — a real run is a deliberate local edit. `--host` must never enter a timer run without separate policy (SEC-001).
 - **New:** `contrib/logrotate/update-vms` for `--log-file`/`--report` output.

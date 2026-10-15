@@ -145,6 +145,7 @@ usage: $(basename "$0") [options]
   --yes            non-interactive confirmation for --host (explicit policy)
   -h, --help       this help
 safety env: MIN_GUEST_FREE_MB (default 500), DISK_CHECK/AGENT_CHECK/BACKUP_CHECK (1|0)
+host env: HOST_UPDATE_TIMEOUT (3600), MIN_HOST_FREE_MB (1000), HOST_REBOOT_MARKER
 exit codes: 0 ok | 1 guest failure(s) | 2 preflight/usage | 3 lock busy
 EOF
 }

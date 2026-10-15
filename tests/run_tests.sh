@@ -592,6 +592,16 @@ test_host_requires_root() {
     assert_calls_not "apt-get update"
 }
 
+# 61. --help prints usage and exits 0 (v2 silently ignored unknown flags;
+# --help must be an explicit, tested path).
+test_help_flag() {
+    run_script --help
+    assert_rc 0
+    assert_log "usage:"
+    assert_log "this help"
+    assert_calls_not "pvesh"
+}
+
 # 60. systemd unit files parse cleanly (ExecStart rewritten to the real
 # script path so verify can stat it). Skipped when systemd-analyze is absent.
 test_systemd_units_valid() {
