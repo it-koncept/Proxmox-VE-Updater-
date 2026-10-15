@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.4 (host updates, Fase B B7)
+- **New:** `--host` updates the PVE host itself: `apt-get update` then `apt-get -y dist-upgrade` (noninteractive, keeps conffiles), each phase bounded by `HOST_UPDATE_TIMEOUT` (default 3600 s).
+- **Policy gate (SEC-001):** a real host run requires typing `YES` at an interactive prompt; with no tty (cron/timer/ssh non-interactive) it refuses with exit 2 unless `--yes` is given explicitly. Never automatic.
+- **Gates:** cluster quorum via `pvecm status` (standalone ok, quorum lost -> refuse, SEC-013); host `/` free space >= `MIN_HOST_FREE_MB` (default 1000); failed `apt-get update` aborts before dist-upgrade (SEC-003); lock held during the run.
+- **New:** after success, `/var/run/reboot-required` (path via `HOST_REBOOT_MARKER`) -> status `warning` "reboot required"; the tool NEVER reboots (FR-009 policy).
+- **New:** `--host --dry-run` runs `apt-get -s dist-upgrade` simulation only — no apt state change; `--host` cannot be combined with `--only/--exclude/--list/--check`; host run recorded in the JSON report as vmid `host`.
+- **Tests:** 12 new cases (60 total, all passing): dry-run simulation-only, unattended refusal, --yes flow, update-failure blocks upgrade, dist failure, quorum lost/quorate, low disk refusal, flag conflicts, report entry, reboot-required warning, non-root refusal. New mocks: `apt-get`, `pvecm`.
+- Live prod-node verification: NOT RUN this round (approval prompt timed out; no retry per policy). Mock coverage stands; live check pending user approval.
+
 ## v3.3 (reporting, Fase B B6)
 - **New:** `--report <path>` writes a JSON report after the run: tool/version/node/mode, start/finish/duration, `summary` (success/warning/skipped/failed) and a `guests` array with per-guest `vmid, type, name, action, status, reason, duration_s` (FR-013). Built with jq only — no hand-concatenated JSON; unwritable path fails in preflight (exit 2) before any work.
 - **New:** `--log-file <path>` appends every timestamped log line to a file (FR-006); unwritable path fails in preflight.

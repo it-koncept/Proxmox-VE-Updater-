@@ -1,0 +1,22 @@
+#!/bin/bash
+# Mock apt-get for tests. Logs every call to $MOCK_CALLS.
+# MOCK_APT_UPDATE_FAIL=1: 'apt-get update' fails (rc 100).
+# MOCK_APT_DIST_FAIL=1: 'dist-upgrade' fails (rc 100).
+echo "apt-get $*" >> "$MOCK_CALLS"
+case "$*" in
+    *dist-upgrade*)
+        if [ "${MOCK_APT_DIST_FAIL:-0}" = "1" ]; then
+            echo "E: dist-upgrade failed (mock)" >&2
+            exit 100
+        fi
+        echo "The following packages will be upgraded: mockpkg (1.0 => 1.1)"
+        ;;
+    *"update"*)
+        if [ "${MOCK_APT_UPDATE_FAIL:-0}" = "1" ]; then
+            echo "E: Some index files failed to download (mock)" >&2
+            exit 100
+        fi
+        echo "Get:1 http://mock stable InRelease"
+        ;;
+esac
+exit 0

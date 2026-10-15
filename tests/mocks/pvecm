@@ -1,0 +1,17 @@
+#!/bin/bash
+# Mock pvecm for tests. MOCK_PVECM_MODE: standalone|quorate|noquorum.
+echo "pvecm $*" >> "$MOCK_CALLS"
+case "${MOCK_PVECM_MODE:-standalone}" in
+    quorate)
+        echo "Quorum: Yes"
+        exit 0
+        ;;
+    noquorum)
+        echo "Quorum: No"
+        exit 0
+        ;;
+    *)
+        echo "No cluster configuration found" >&2
+        exit 255
+        ;;
+esac

@@ -36,10 +36,12 @@ reset_env() {
     export MOCK_PCT_FAIL_VMS="" MOCK_PCT_HANG=0
     export MOCK_QM_AGENT_DOWN_VMS="" MOCK_QM_RC=0
     export MOCK_GUEST_DF_FAIL_VMS="" MOCK_BACKUP_FAIL=0
+    export MOCK_APT_UPDATE_FAIL=0 MOCK_APT_DIST_FAIL=0 MOCK_PVECM_MODE=standalone
     unset PCT_EXEC_TIMEOUT QEMU_EXEC_TIMEOUT MOCK_PVESH_FIXTURE
     unset MOCK_GUEST_DF MOCK_BACKUP_FIXTURE MIN_GUEST_FREE_MB
     unset DISK_CHECK AGENT_CHECK BACKUP_CHECK
     unset REPORT_PATH LOG_FILE_PATH
+    unset HOST_UPDATE_TIMEOUT MIN_HOST_FREE_MB HOST_REBOOT_MARKER
     OUT=""; RC=0
 }
 
@@ -477,6 +479,107 @@ test_check_report() {
     [ "$(jq -r '.mode' "$T_DIR/r.json")" = "check" ] || fail "mode not check"
     [ "$(jq '.guests | length' "$T_DIR/r.json")" -eq 8 ] || fail "guests != 8"
     [ "$(jq '[.guests[] | select(.status=="planned")] | length' "$T_DIR/r.json")" -eq 8 ] || fail "not all planned"
+}
+
+# 48. --host --dry-run: simulation only, no mutating apt calls (SEC-011).
+test_host_dry_run_simulation_only() {
+    run_script --host --dry-run
+    assert_rc 0
+    assert_log "HOST DRY-RUN"
+    assert_calls "apt-get -s dist-upgrade"
+    assert_calls_not "apt-get update"
+    assert_calls_not "apt-get -y"
+}
+
+# 49. Real --host without --yes on a non-tty must refuse (SEC-001).
+test_host_refuses_unattended() {
+    run_script --host
+    assert_rc 2
+    assert_log "not a terminal"
+    assert_calls_not "apt-get update"
+}
+
+# 50. --host --yes (explicit policy) runs update then dist-upgrade.
+test_host_yes_runs() {
+    run_script --host --yes
+    assert_rc 0
+    assert_calls "apt-get update"
+    assert_calls "dist-upgrade"
+    assert_log "updated successfully"
+}
+
+# 51. Failed apt-get update must abort before dist-upgrade (SEC-003).
+test_host_update_failure_blocks_upgrade() {
+    MOCK_APT_UPDATE_FAIL=1 run_script --host --yes
+    assert_rc 1
+    assert_log "NOT attempted"
+    assert_calls_not "apt-get -y"
+}
+
+# 52. dist-upgrade failure is reported as failed.
+test_host_dist_failure() {
+    MOCK_APT_DIST_FAIL=1 run_script --host --yes
+    assert_rc 1
+    assert_log "dist-upgrade failed"
+}
+
+# 53. Lost cluster quorum refuses the host update (SEC-013).
+test_host_no_quorum_refuses() {
+    MOCK_PVECM_MODE=noquorum run_script --host --yes
+    assert_rc 2
+    assert_log "quorum LOST"
+    assert_calls_not "apt-get update"
+}
+
+# 54. Quorate cluster passes the quorum gate.
+test_host_quorate_ok() {
+    MOCK_PVECM_MODE=quorate run_script --host --yes
+    assert_rc 0
+    assert_log "quorum ok"
+}
+
+# 55. Low host disk space refuses the update.
+test_host_low_disk_refuses() {
+    MIN_HOST_FREE_MB=999999999 run_script --host --yes
+    assert_rc 2
+    assert_log "below MIN_HOST_FREE_MB"
+    assert_calls_not "apt-get update"
+}
+
+# 56. --host cannot be mixed with guest filters/modes.
+test_host_conflict_flags() {
+    run_script --host --only 107
+    assert_rc 2
+    assert_log "cannot be combined"
+}
+
+# 57. Host run appears in the report with status success.
+test_host_report() {
+    run_script --host --yes --report "$T_DIR/r.json"
+    assert_rc 0
+    [ "$(jq -r '.mode' "$T_DIR/r.json")" = "host" ] || fail "mode not host"
+    [ "$(jq -r '.guests[0].vmid' "$T_DIR/r.json")" = "host" ] || fail "host entry missing"
+    [ "$(jq -r '.guests[0].status' "$T_DIR/r.json")" = "success" ] || fail "host not success"
+}
+
+# 58. reboot-required marker -> warning, never an automatic reboot (FR-009).
+test_host_reboot_required_warning() {
+    touch "$T_DIR/reboot-required"
+    HOST_REBOOT_MARKER="$T_DIR/reboot-required" run_script --host --yes --report "$T_DIR/r.json"
+    assert_rc 0
+    assert_log "reboot required"
+    assert_log "NOT rebooting"
+    [ "$(jq -r '.guests[0].status' "$T_DIR/r.json")" = "warning" ] || fail "host not warning"
+    [ "$(jq -r '.summary.warning' "$T_DIR/r.json")" -eq 1 ] || fail "summary.warning != 1"
+}
+
+# 59. Real --host as non-root aborts before anything (SEC-008).
+test_host_requires_root() {
+    unset MOCK_ID_UID
+    run_script --host --yes
+    assert_rc 2
+    assert_log "root is required"
+    assert_calls_not "apt-get update"
 }
 
 # ---- run -----------------------------------------------------------------

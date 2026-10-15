@@ -107,6 +107,19 @@ Reporting (v3.3):
 `failed`, or `planned` in dry-run/list/check). `--log-file` appends the
 timestamped log. Unwritable paths fail in preflight before any work starts.
 
+Host updates (v3.4, policy-gated):
+
+```bash
+./update-vms.sh --host --dry-run   # simulation only (apt-get -s), no changes
+./update-vms.sh --host             # prompts: type YES to confirm
+./update-vms.sh --host --yes       # explicit non-interactive policy only
+```
+
+Refuses without confirmation on non-tty (cron/timer), refuses when cluster
+quorum is lost or host `/` free space is below `MIN_HOST_FREE_MB` (default
+1000), and aborts before dist-upgrade if `apt-get update` fails. A detected
+reboot requirement is reported as a warning — the tool never reboots.
+
 Run manually:
 
 ```bash

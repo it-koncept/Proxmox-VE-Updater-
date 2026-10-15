@@ -8,6 +8,18 @@
 #   yum     -> dnf -y update if present, else yum -y update
 #   windows -> skipped
 #
+# v3.4 (B7) adds host updates (FR-002, SEC-001/003/013) - gated by policy:
+#   --host             update THIS host: apt-get update && dist-upgrade
+#   --yes              skip interactive confirmation (explicit policy only;
+#                      without it a real host run needs a tty + typing YES)
+#   - refused when cluster quorum is lost (pvecm status; standalone ok)
+#   - refused when host / free space < MIN_HOST_FREE_MB (default 1000)
+#   - failed apt-get update aborts before dist-upgrade (SEC-003)
+#   - HOST_UPDATE_TIMEOUT (default 3600) bounds each apt phase
+#   - after success: reboot-required marker -> status warning (no auto reboot)
+#   - --host --dry-run: simulation only (apt-get -s), no state change
+#   - never combine --host with --only/--exclude/--list/--check
+#
 # v3.3 (B6) adds reporting (FR-006, FR-013):
 #   --report <path>    write a JSON report (per-guest status/reason/duration,
 #                      summary, mode, timings) after the run
@@ -67,7 +79,7 @@
 #
 set -u -o pipefail
 
-VERSION="3.3.0"
+VERSION="3.4.0"
 EXIT_OK=0
 EXIT_GUEST_FAILURE=1
 EXIT_PREFLIGHT=2
@@ -77,6 +89,9 @@ LOCK_FILE="${LOCK_FILE:-/var/lock/update-vms.lock}"
 NODE="${PVE_NODE:-$(hostname)}"
 QEMU_EXEC_TIMEOUT="${QEMU_EXEC_TIMEOUT:-1800}"
 PCT_EXEC_TIMEOUT="${PCT_EXEC_TIMEOUT:-1800}"
+HOST_UPDATE_TIMEOUT="${HOST_UPDATE_TIMEOUT:-3600}"
+MIN_HOST_FREE_MB="${MIN_HOST_FREE_MB:-1000}"
+HOST_REBOOT_MARKER="${HOST_REBOOT_MARKER:-/var/run/reboot-required}"
 MIN_GUEST_FREE_MB="${MIN_GUEST_FREE_MB:-500}"
 DISK_CHECK="${DISK_CHECK:-1}"
 AGENT_CHECK="${AGENT_CHECK:-1}"
@@ -84,6 +99,8 @@ BACKUP_CHECK="${BACKUP_CHECK:-1}"
 DRY_RUN=0
 LIST=0
 CHECK=0
+HOST_MODE=0
+ASSUME_YES=0
 ONLY=""
 EXCLUDE=""
 REPORT_PATH="${REPORT_PATH:-}"
@@ -124,6 +141,8 @@ usage: $(basename "$0") [options]
   --exclude <ids>  skip these VMIDs (comma-separated, numeric)
   --report <path>  write JSON report to path after the run (v3.3)
   --log-file <p>   also append log lines to file (v3.3)
+  --host           update this host (apt update + dist-upgrade) (v3.4)
+  --yes            non-interactive confirmation for --host (explicit policy)
   -h, --help       this help
 safety env: MIN_GUEST_FREE_MB (default 500), DISK_CHECK/AGENT_CHECK/BACKUP_CHECK (1|0)
 exit codes: 0 ok | 1 guest failure(s) | 2 preflight/usage | 3 lock busy
@@ -157,6 +176,8 @@ while [ $# -gt 0 ]; do
         --log-file)
             require_value --log-file $#; LOG_FILE_PATH="$2"; shift ;;
         --log-file=*)  LOG_FILE_PATH="${1#--log-file=}" ;;
+        --host)    HOST_MODE=1 ;;
+        --yes)     ASSUME_YES=1 ;;
         -h|--help) usage; exit "$EXIT_OK" ;;
         *) echo "error: unknown argument: $1" >&2; usage; exit "$EXIT_PREFLIGHT" ;;
     esac
@@ -197,6 +218,18 @@ if ! is_uint "$PCT_EXEC_TIMEOUT"; then
 fi
 if ! is_uint "$MIN_GUEST_FREE_MB"; then
     log "preflight: MIN_GUEST_FREE_MB must be a non-negative integer (got: $MIN_GUEST_FREE_MB)"
+    exit "$EXIT_PREFLIGHT"
+fi
+if ! is_uint "$HOST_UPDATE_TIMEOUT"; then
+    log "preflight: HOST_UPDATE_TIMEOUT must be a non-negative integer (got: $HOST_UPDATE_TIMEOUT)"
+    exit "$EXIT_PREFLIGHT"
+fi
+if ! is_uint "$MIN_HOST_FREE_MB"; then
+    log "preflight: MIN_HOST_FREE_MB must be a non-negative integer (got: $MIN_HOST_FREE_MB)"
+    exit "$EXIT_PREFLIGHT"
+fi
+if [ "$HOST_MODE" -eq 1 ] && { [ -n "$ONLY" ] || [ -n "$EXCLUDE" ] || [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ]; }; then
+    log "preflight: --host cannot be combined with --only/--exclude/--list/--check"
     exit "$EXIT_PREFLIGHT"
 fi
 for flag in DISK_CHECK AGENT_CHECK BACKUP_CHECK; do
@@ -335,6 +368,107 @@ write_report() {
     return 0
 }
 
+# Cluster quorum check before host changes (SEC-013); standalone is fine.
+host_quorum_ok() {
+    local out rc
+    out=$(pvecm status 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if printf '%s' "$out" | grep -qi "no cluster configuration"; then
+            log "host: standalone node (no cluster) - quorum check not applicable"
+            return 0
+        fi
+        log "host preflight: pvecm status failed (rc=$rc):"
+        printf '%s\n' "$out" | head -3 | sed 's/^/   | /'
+        return 1
+    fi
+    if printf '%s' "$out" | grep -q "Quorum: Yes"; then
+        log "host: cluster quorum ok"
+        return 0
+    fi
+    log "host preflight: cluster quorum LOST - refusing host update (SEC-013)"
+    return 1
+}
+
+# Host update workflow (FR-002). Never automatic: needs tty+YES or --yes.
+run_host_update() {
+    local out rc answer free hstart=$SECONDS
+    for bin in apt-get pvecm df; do
+        if ! command -v "$bin" >/dev/null 2>&1; then
+            log "host preflight: required command not found: $bin"
+            return "$EXIT_PREFLIGHT"
+        fi
+    done
+    if ! host_quorum_ok; then return "$EXIT_PREFLIGHT"; fi
+    free=$(df -P -k / | awk 'NR==2 {print $4}')
+    if ! is_uint "$free" || [ "$free" -lt $((MIN_HOST_FREE_MB * 1024)) ]; then
+        log "host preflight: free space on / below MIN_HOST_FREE_MB=$MIN_HOST_FREE_MB - refusing"
+        return "$EXIT_PREFLIGHT"
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "HOST DRY-RUN: would run: apt-get update && apt-get -y dist-upgrade (timeout ${HOST_UPDATE_TIMEOUT}s each)"
+        out=$(apt-get -s dist-upgrade 2>&1)
+        printf '%s\n' "$out" | tail -3 | sed 's/^/   | /'
+        record_guest "host" "host" "$NODE" "dist-upgrade" planned "dry-run simulation" $((SECONDS-hstart))
+        if [ -n "$REPORT_PATH" ]; then write_report "host-dry-run"; fi
+        return "$EXIT_OK"
+    fi
+    # confirmation gate (SEC-001): typed YES on a tty, or explicit --yes policy
+    if [ "$ASSUME_YES" -ne 1 ]; then
+        if [ ! -t 0 ]; then
+            log "host: refusing unattended host upgrade - stdin is not a terminal and --yes was not given (SEC-001)"
+            return "$EXIT_PREFLIGHT"
+        fi
+        printf 'Type YES to run apt-get update + dist-upgrade on host %s: ' "$NODE"
+        if ! IFS= read -r answer; then
+            log "host: no confirmation received - aborting"
+            return "$EXIT_PREFLIGHT"
+        fi
+        if [ "$answer" != "YES" ]; then
+            log "host: confirmation not given - aborting"
+            return "$EXIT_PREFLIGHT"
+        fi
+    else
+        log "host: --yes given - running without interactive confirmation (explicit policy)"
+    fi
+    if ! { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
+        log "preflight: cannot open lock file: $LOCK_FILE"
+        return "$EXIT_PREFLIGHT"
+    fi
+    if ! flock -n 9; then
+        log "Another update-vms run is already in progress - exiting."
+        return "$EXIT_LOCK"
+    fi
+    log "=== host update start (node=$NODE) ==="
+    out=$(timeout "$HOST_UPDATE_TIMEOUT" apt-get update 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "host: apt-get update failed (rc=$rc) - dist-upgrade NOT attempted (SEC-003)"
+        printf '%s\n' "$out" | tail -5 | sed 's/^/   | /'
+        record_guest "host" "host" "$NODE" "dist-upgrade" failed "apt-get update failed" $((SECONDS-hstart))
+        if [ -n "$REPORT_PATH" ]; then write_report "host"; fi
+        return "$EXIT_GUEST_FAILURE"
+    fi
+    out=$(timeout "$HOST_UPDATE_TIMEOUT" apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "host: apt-get dist-upgrade failed (rc=$rc)"
+        printf '%s\n' "$out" | tail -5 | sed 's/^/   | /'
+        record_guest "host" "host" "$NODE" "dist-upgrade" failed "dist-upgrade failed" $((SECONDS-hstart))
+        if [ -n "$REPORT_PATH" ]; then write_report "host"; fi
+        return "$EXIT_GUEST_FAILURE"
+    fi
+    if [ -f "$HOST_REBOOT_MARKER" ]; then
+        log "host: updated; reboot required ($HOST_REBOOT_MARKER) - NOT rebooting automatically (SEC-001)"
+        WARN=$((WARN+1))
+        record_guest "host" "host" "$NODE" "dist-upgrade" warning "reboot required" $((SECONDS-hstart))
+    else
+        log "host: updated successfully"
+        OK=$((OK+1))
+        record_guest "host" "host" "$NODE" "dist-upgrade" success "" $((SECONDS-hstart))
+    fi
+    log "=== host update done ==="
+    if [ -n "$REPORT_PATH" ]; then write_report "host"; fi
+    return "$EXIT_OK"
+}
+
 OK=0; WARN=0; FAIL=0; SKIP=0
 
 run_guest_cmd() {
@@ -370,6 +504,12 @@ run_guest_cmd() {
 
 APT_CMD='export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade'
 YUM_CMD='if command -v dnf >/dev/null 2>&1; then dnf -y update; else yum -y update; fi'
+
+# ---- host update mode (v3.4) ----------------------------------------------
+if [ "$HOST_MODE" -eq 1 ]; then
+    run_host_update
+    exit $?
+fi
 
 # ---- fetch guest inventory (SEC-010: never a silent empty success) -------
 if ! resources=$(pvesh get /cluster/resources --type vm --output-format json 2>&1); then
