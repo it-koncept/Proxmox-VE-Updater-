@@ -1,0 +1,11 @@
+[
+  {"node":"testnode","vmid":107,"type":"lxc","status":"running","tags":"apt","name":"nextcloud.test"},
+  {"node":"testnode","vmid":111,"type":"lxc","status":"running","tags":"apt","name":"tftp.test"},
+  {"node":"testnode","vmid":114,"type":"lxc","status":"stopped","tags":"","name":"stopped.test"},
+  {"node":"testnode","vmid":150,"type":"lxc","status":"running","tags":"windows","name":"win.test"},
+  {"node":"testnode","vmid":102,"type":"qemu","status":"running","tags":"yum","name":"mail.test"},
+  {"node":"testnode","vmid":999,"type":"qemu","status":"running","tags":"compat","name":"trap.test","description":"has spaces here"},
+  {"node":"testnode","vmid":"abc","type":"lxc","status":"running","tags":"apt","name":"garbage.test"},
+  {"node":"testnode","vmid":121,"type":"lxc","status":"running","tags":"","name":"untagged.test"},
+  {"node":"othernode","vmid":207,"type":"lxc","status":"running","tags":"apt","name":"othernode.test"}
+]

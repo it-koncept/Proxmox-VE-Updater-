@@ -1,0 +1,14 @@
+#!/bin/bash
+# Mock qm for tests. Logs every call to $MOCK_CALLS.
+# MOCK_QM_AGENT_DOWN_VMS: comma-separated VMIDs that fail with agent error.
+# MOCK_QM_RC: guest command exitcode embedded in the returned JSON.
+echo "qm $*" >> "$MOCK_CALLS"
+if [ "${1:-}" = "guest" ] && [ "${2:-}" = "exec" ]; then
+    vmid="${3:-}"
+    if printf '%s' ",${MOCK_QM_AGENT_DOWN_VMS:-}," | grep -q ",$vmid,"; then
+        echo "QEMU guest agent is not running" >&2
+        exit 1
+    fi
+    printf '{"exitcode": %s, "out-data": ""}\n' "${MOCK_QM_RC:-0}"
+fi
+exit 0

@@ -1,0 +1,20 @@
+#!/bin/bash
+# Mock pvesh for tests. Logs every call to $MOCK_CALLS and serves fixtures.
+# Never touches the real system.
+echo "pvesh $*" >> "$MOCK_CALLS"
+case "$*" in
+    *cluster/resources*)
+        if [ "${MOCK_PVESH_FAIL:-0}" = "1" ]; then
+            echo "pvesh: command failed (mock)" >&2
+            exit 255
+        fi
+        if [ "${MOCK_PVESH_GARBAGE:-0}" = "1" ]; then
+            echo "not json at all"
+            exit 0
+        fi
+        cat "${MOCK_PVESH_FIXTURE:-$MOCK_FIXTURES/resources_basic.json}"
+        ;;
+    *)
+        exit 0
+        ;;
+esac

@@ -1,0 +1,8 @@
+#!/bin/bash
+# Mock id: returns MOCK_ID_UID for `id -u` when set (simulate root in tests).
+# Otherwise delegates to the real id.
+if [ -n "${MOCK_ID_UID:-}" ] && [ "${1:-}" = "-u" ]; then
+    echo "$MOCK_ID_UID"
+    exit 0
+fi
+exec /usr/bin/id "$@"
