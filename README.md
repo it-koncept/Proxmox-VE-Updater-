@@ -120,6 +120,23 @@ crontab -e
 | `QEMU_EXEC_TIMEOUT` | 1800      | `qm guest exec --timeout` in seconds      |
 | `PCT_EXEC_TIMEOUT`  | 1800      | `timeout` wrapper around `pct exec` (v3)  |
 | `LOCK_FILE`         | `/var/lock/update-vms.lock` | Single-instance lock path (v3)          |
+| `MIN_GUEST_FREE_MB` | 500       | min free MB on guest `/` before upgrade (v3.2) |
+| `DISK_CHECK`        | 1         | guest disk preflight on/off (0/1) (v3.2)  |
+| `AGENT_CHECK`       | 1         | QEMU Guest Agent preflight on/off (0/1) (v3.2) |
+| `BACKUP_CHECK`      | 1         | backup-job coverage warnings on/off (0/1) (v3.2) |
+
+### Safety preflight per guest (v3.2)
+
+Before a tagged guest is updated:
+
+1. **QEMU guests:** the Guest Agent must be configured and responding —
+   otherwise the guest is *skipped* with a hint (`qm set <id> -agent enabled=1`),
+   never counted as success.
+2. **Disk space:** free space on guest `/` must be ≥ `MIN_GUEST_FREE_MB`;
+   a failing or unparseable check also skips (unknown prerequisites are
+   never treated as ready).
+3. **Backup coverage (advisory):** guests not covered by any enabled vzdump
+   job produce a warning; an unreadable job list warns `backup status unknown`.
 
 ### Exit codes (v3)
 

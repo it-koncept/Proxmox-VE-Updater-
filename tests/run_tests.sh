@@ -35,7 +35,10 @@ reset_env() {
     export MOCK_PVESH_FAIL=0 MOCK_PVESH_GARBAGE=0
     export MOCK_PCT_FAIL_VMS="" MOCK_PCT_HANG=0
     export MOCK_QM_AGENT_DOWN_VMS="" MOCK_QM_RC=0
+    export MOCK_GUEST_DF_FAIL_VMS="" MOCK_BACKUP_FAIL=0
     unset PCT_EXEC_TIMEOUT QEMU_EXEC_TIMEOUT MOCK_PVESH_FIXTURE
+    unset MOCK_GUEST_DF MOCK_BACKUP_FIXTURE MIN_GUEST_FREE_MB
+    unset DISK_CHECK AGENT_CHECK BACKUP_CHECK
     OUT=""; RC=0
 }
 
@@ -113,7 +116,8 @@ test_one_guest_fails() {
 test_apt_update_chained() {
     run_script
     local line
-    line=$(grep -F "pct exec 107" "$T_CALLS" | head -1)
+    line=$(grep -F "pct exec 107" "$T_CALLS" | grep -F "apt-get" | head -1)
+    [ -n "$line" ] || fail "no apt-get call for 107"
     printf '%s' "$line" | grep -qF "apt-get update" || fail "no apt-get update in call"
     printf '%s' "$line" | grep -qE 'apt-get update.*&&.*upgrade' || fail "update not &&-chained to upgrade"
 }
@@ -165,17 +169,18 @@ test_stopped_guest_skipped() {
     assert_calls_not "pct exec 114"
 }
 
-# 11. Missing guest agent: guest must be failed, never success.
+# 11. Missing guest agent: preflight skips the guest; never success.
 test_agent_down_not_success() {
     MOCK_QM_AGENT_DOWN_VMS=102 run_script
-    assert_rc 1
-    assert_log "1 failed"
-    assert_log_not "3 updated"
+    assert_rc 0
+    assert_log "no guest agent"
+    assert_calls_not "qm guest exec 102"
+    assert_log "2 updated, 0 failed"
 }
 
-# 12. pct exec must respect PCT_EXEC_TIMEOUT.
+# 12. pct exec must respect PCT_EXEC_TIMEOUT (disk preflight off here).
 test_pct_timeout() {
-    PCT_EXEC_TIMEOUT=1 MOCK_PCT_HANG=1 run_script
+    DISK_CHECK=0 PCT_EXEC_TIMEOUT=1 MOCK_PCT_HANG=1 run_script
     assert_rc 1
     assert_log "timed out"
 }
@@ -329,6 +334,76 @@ test_only_missing_value() {
     run_script --only
     assert_rc 2
     assert_log "requires a value"
+}
+
+# 32. Low free disk in guest -> guest skipped, never updated (SEC-009).
+test_disk_low_skips_guest() {
+    MOCK_GUEST_DF=1000 run_script
+    assert_rc 0
+    assert_log "insufficient disk space"
+    printf '%s\n' "$OUT" | grep -q "apt-get" && fail "upgrade must not run on low-disk guest"
+    grep -E "pct exec .*apt-get" "$T_CALLS" && fail "apt call reached low-disk guest"
+    assert_log "0 updated, 0 failed"
+}
+
+# 33. Failing/unparseable disk check -> skip (unknown prerequisites).
+test_disk_check_failure_skips() {
+    MOCK_GUEST_DF_FAIL_VMS=107 run_script
+    assert_rc 0
+    assert_log "disk space check failed"
+    printf '%s' "$(grep -c "pct exec 107.*apt-get" "$T_CALLS")" | grep -qx 0 || fail "107 must not be updated"
+    assert_calls "pct exec 111"
+}
+
+# 34. Disk preflight can be disabled explicitly.
+test_disk_check_disabled() {
+    DISK_CHECK=0 MOCK_GUEST_DF=1000 run_script
+    assert_rc 0
+    assert_log "3 updated, 0 failed"
+}
+
+# 35. Guest not covered by an enabled backup job -> warn but proceed (FR-010).
+test_backup_not_covered_warns() {
+    MOCK_BACKUP_FIXTURE="$FIXTURES/jobs_partial.json" run_script --dry-run
+    assert_rc 0
+    assert_log "102 (qemu): not covered by any enabled backup job"
+    assert_log_not "107 (lxc): not covered"
+}
+
+# 36. Unreadable backup job list -> "backup status unknown" warning (FR-010).
+test_backup_unknown_warns() {
+    MOCK_BACKUP_FAIL=1 run_script --dry-run
+    assert_rc 0
+    assert_log "backup status unknown"
+}
+
+# 37. --check reports agent and backup gaps for update candidates.
+test_check_reports_agent_and_backup_gaps() {
+    MOCK_QM_AGENT_DOWN_VMS=102 MOCK_BACKUP_FIXTURE="$FIXTURES/jobs_partial.json" run_script --check
+    assert_rc 0
+    assert_log "update candidates without guest agent: 1"
+    assert_log "update candidates not covered by an enabled backup job: 1"
+}
+
+# 38. Invalid MIN_GUEST_FREE_MB rejected.
+test_min_free_invalid() {
+    MIN_GUEST_FREE_MB=abc run_script
+    assert_rc 2
+    assert_log "MIN_GUEST_FREE_MB"
+}
+
+# 39. Invalid check-flag env (DISK_CHECK=2) rejected.
+test_check_flag_invalid() {
+    DISK_CHECK=2 run_script
+    assert_rc 2
+    assert_log "DISK_CHECK must be 0 or 1"
+}
+
+# 40. Agent preflight can be disabled explicitly (then exec path fails, rc 1).
+test_agent_check_disabled_fails_via_exec() {
+    AGENT_CHECK=0 MOCK_QM_AGENT_DOWN_VMS=102 run_script
+    assert_rc 1
+    assert_log "1 failed"
 }
 
 # ---- run -----------------------------------------------------------------

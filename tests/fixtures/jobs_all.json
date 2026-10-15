@@ -1,0 +1,3 @@
+[
+  {"id":"job-weekly","enabled":1,"all":1,"schedule":"sun 01:00","storage":"Backup","type":"vzdump","prune-backups":{"keep-last":"14"}}
+]

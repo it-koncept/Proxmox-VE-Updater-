@@ -1,10 +1,20 @@
 #!/bin/bash
 # Mock pct for tests. Logs every call to $MOCK_CALLS.
-# MOCK_PCT_FAIL_VMS: comma-separated VMIDs whose exec returns rc=100.
+# df -P calls (disk preflight): MOCK_GUEST_DF = free KB (default 50 GB),
+#   MOCK_GUEST_DF_FAIL_VMS = vmids whose df fails.
+# Other exec calls: MOCK_PCT_FAIL_VMS = vmids returning rc=100.
 # MOCK_PCT_HANG=1: sleep (to exercise timeout handling).
 echo "pct $*" >> "$MOCK_CALLS"
 if [ "${1:-}" = "exec" ]; then
     vmid="${2:-}"
+    if printf '%s' "$*" | grep -q "df -P"; then
+        if printf '%s' ",${MOCK_GUEST_DF_FAIL_VMS:-}," | grep -q ",$vmid,"; then
+            echo "df: no such file (mock)" >&2
+            exit 1
+        fi
+        printf 'Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/sda1 1000000 100 %s 91%% /\n' "${MOCK_GUEST_DF:-50000000}"
+        exit 0
+    fi
     if [ "${MOCK_PCT_HANG:-0}" = "1" ]; then
         sleep 10
     fi

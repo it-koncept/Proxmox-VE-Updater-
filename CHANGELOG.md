@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.2 (safety preflight, Fase B B5)
+- **New:** QEMU Guest Agent preflight — update candidates are checked via `pvesh get /nodes/<node>/qemu/<id>/agent` before any exec; no/unresponsive agent -> guest **skipped** with an explicit fix hint (`qm set <id> -agent enabled=1`), never reported as success. Disable with `AGENT_CHECK=0` (then the exec path fails as before).
+- **New:** guest disk-space preflight — `df -P -k /` inside the guest; free space below `MIN_GUEST_FREE_MB` (default 500) or a failed/unparseable check -> guest skipped with a warning (SEC-009: unknown prerequisites are never treated as ready). Skipped in `--dry-run` (keeps dry-run free of guest exec). Disable with `DISK_CHECK=0`.
+- **New:** backup coverage (FR-010) — enabled vzdump jobs read from `/cluster/backup`; guests not covered by any enabled job warn per guest; unreadable job list warns `backup status unknown`. Advisory by design (warn, don't block); disable with `BACKUP_CHECK=0`.
+- **New:** `--check` now also reports update candidates without guest agent and without backup-job coverage.
+- **New env:** `MIN_GUEST_FREE_MB`, `DISK_CHECK`, `AGENT_CHECK`, `BACKUP_CHECK` (validated: numeric / 0-1).
+- **Tests:** 9 new cases (40 total, all passing): low disk skip, failed disk check skip, disk check disable, backup not-covered warning, backup-unknown warning, --check gap reporting, invalid env rejection, agent-check disable. Mocks extended with df/agent/backup-job fixtures. One real bug caught and fixed: free-space parsing concatenated all digits of the df table into one overflow number.
+- Verified live on prod-node with `--check` only (read-only): correctly reported 2 yum candidates without guest agent (102, 104) and 0 backup coverage gaps (weekly all=1 job).
+
 ## v3.1 (CLI, Fase B B4)
 - **New:** `--version` prints the version (now `3.1.0`).
 - **New:** `--list` — read-only table of node guests with planned action per guest (`apt`/`yum`/`windows`/`stopped`/`no-tag`/`excluded`/`not-targeted`/`malformed`); works as non-root; takes no lock.

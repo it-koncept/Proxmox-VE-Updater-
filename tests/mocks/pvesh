@@ -3,6 +3,22 @@
 # Never touches the real system.
 echo "pvesh $*" >> "$MOCK_CALLS"
 case "$*" in
+    *"/agent"*)
+        # path form: /nodes/<node>/qemu/<vmid>/agent
+        vmid=$(printf '%s' "$*" | sed -n 's|.*/qemu/\([0-9][0-9]*\)/agent.*|\1|p')
+        if printf '%s' ",${MOCK_QM_AGENT_DOWN_VMS:-}," | grep -q ",$vmid,"; then
+            echo "QEMU guest agent is not running" >&2
+            exit 255
+        fi
+        echo '{"status":"ok"}'
+        ;;
+    *cluster/backup*)
+        if [ "${MOCK_BACKUP_FAIL:-0}" = "1" ]; then
+            echo "pvesh: backup job list failed (mock)" >&2
+            exit 255
+        fi
+        cat "${MOCK_BACKUP_FIXTURE:-$MOCK_FIXTURES/jobs_all.json}"
+        ;;
     *cluster/resources*)
         if [ "${MOCK_PVESH_FAIL:-0}" = "1" ]; then
             echo "pvesh: command failed (mock)" >&2

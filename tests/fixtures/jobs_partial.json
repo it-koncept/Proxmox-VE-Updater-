@@ -1,0 +1,3 @@
+[
+  {"id":"job-partial","enabled":1,"vmid":"107,111","schedule":"daily 23:30","storage":"Backup","type":"vzdump","prune-backups":{"keep-last":"7"}}
+]

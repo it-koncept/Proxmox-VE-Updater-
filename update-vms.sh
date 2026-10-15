@@ -8,6 +8,17 @@
 #   yum     -> dnf -y update if present, else yum -y update
 #   windows -> skipped
 #
+# v3.2 (B5) adds safety preflight (FR-007/010, SEC-009):
+#   - Guest Agent preflight for QEMU update candidates: no agent -> skipped
+#     with an explicit reason, never reported as success.
+#   - Guest disk-space preflight (df -P /): free space below
+#     MIN_GUEST_FREE_MB (default 500 MB) or an unparseable/failed check
+#     -> guest skipped with a warning. Skipped in --dry-run (no guest exec).
+#   - Backup coverage (FR-010): enabled vzdump jobs from /cluster/backup;
+#     guests not covered by any enabled job warn; unreadable job list
+#     warns "backup status unknown". Advisory (warn), never blocks.
+#   Env: MIN_GUEST_FREE_MB, DISK_CHECK, AGENT_CHECK, BACKUP_CHECK (see usage).
+#
 # v3.1 (B4) adds CLI surface (FR-008, SEC-007):
 #   --version          print version and exit
 #   --list             list node guests + planned action (read-only, non-root ok)
@@ -49,7 +60,7 @@
 #
 set -u -o pipefail
 
-VERSION="3.1.0"
+VERSION="3.2.0"
 EXIT_OK=0
 EXIT_GUEST_FAILURE=1
 EXIT_PREFLIGHT=2
@@ -59,6 +70,10 @@ LOCK_FILE="${LOCK_FILE:-/var/lock/update-vms.lock}"
 NODE="${PVE_NODE:-$(hostname)}"
 QEMU_EXEC_TIMEOUT="${QEMU_EXEC_TIMEOUT:-1800}"
 PCT_EXEC_TIMEOUT="${PCT_EXEC_TIMEOUT:-1800}"
+MIN_GUEST_FREE_MB="${MIN_GUEST_FREE_MB:-500}"
+DISK_CHECK="${DISK_CHECK:-1}"
+AGENT_CHECK="${AGENT_CHECK:-1}"
+BACKUP_CHECK="${BACKUP_CHECK:-1}"
 DRY_RUN=0
 LIST=0
 CHECK=0
@@ -78,6 +93,7 @@ usage: $(basename "$0") [options]
   --only <ids>     only these VMIDs (comma-separated, numeric)
   --exclude <ids>  skip these VMIDs (comma-separated, numeric)
   -h, --help       this help
+safety env: MIN_GUEST_FREE_MB (default 500), DISK_CHECK/AGENT_CHECK/BACKUP_CHECK (1|0)
 exit codes: 0 ok | 1 guest failure(s) | 2 preflight/usage | 3 lock busy
 EOF
 }
@@ -141,6 +157,16 @@ if ! is_uint "$PCT_EXEC_TIMEOUT"; then
     log "preflight: PCT_EXEC_TIMEOUT must be a non-negative integer (got: $PCT_EXEC_TIMEOUT)"
     exit "$EXIT_PREFLIGHT"
 fi
+if ! is_uint "$MIN_GUEST_FREE_MB"; then
+    log "preflight: MIN_GUEST_FREE_MB must be a non-negative integer (got: $MIN_GUEST_FREE_MB)"
+    exit "$EXIT_PREFLIGHT"
+fi
+for flag in DISK_CHECK AGENT_CHECK BACKUP_CHECK; do
+    case "${!flag}" in
+        0|1) ;;
+        *) log "preflight: $flag must be 0 or 1 (got: ${!flag})"; exit "$EXIT_PREFLIGHT" ;;
+    esac
+done
 
 for bin in jq pvesh pct qm flock timeout; do
     if ! command -v "$bin" >/dev/null 2>&1; then
@@ -179,6 +205,56 @@ guest_action() {
     if has_tag "$tags" "yum"; then echo "yum"; return; fi
     if has_tag "$tags" "apt"; then echo "apt"; return; fi
     echo "no-tag"
+}
+
+# QEMU Guest Agent readiness (SEC-009): agent configured AND responding.
+guest_has_agent() {
+    local vmid="$1" out
+    out=$(pvesh get "/nodes/$NODE/qemu/$vmid/agent" --output-format json 2>&1) || return 1
+    printf '%s' "$out" | jq -e '.status == "ok"' >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# Backup coverage (FR-010): is VMID covered by an ENABLED vzdump job
+# (all=1 or explicit vmid list)? $BACKUP_JOBS must be a JSON array.
+backup_covers() {
+    local vmid="$1"
+    printf '%s' "$BACKUP_JOBS" | jq -e --arg id "$vmid" '
+        any(.[];
+            (((.enabled // 0) | tostring) == "1")
+            and (
+                (((.all // 0) | tostring) == "1")
+                or (((.vmid // "") | tostring | split(",")
+                     | map(gsub("[[:space:]]"; "")) | index($id)) != null)
+            )
+        )' >/dev/null 2>&1
+}
+
+# Guest disk preflight (SEC-009). Returns: 0 ok | 1 below threshold | 2 unknown.
+check_guest_disk() {
+    local type="$1" vmid="$2" out rc free_kb
+    local cmd="df -P -k / | awk 'NR==2 {print \$4}'"
+    if [ "$type" = "lxc" ]; then
+        out=$(timeout "$PCT_EXEC_TIMEOUT" pct exec "$vmid" -- bash -c "$cmd" 2>&1)
+        rc=$?
+    else
+        out=$(qm guest exec "$vmid" --timeout 60 -- bash -c "$cmd" 2>&1)
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            rc=$(printf '%s' "$out" | jq -r '.exitcode // 1' 2>/dev/null || echo 1)
+            out=$(printf '%s' "$out" | jq -r '."out-data" // ""' 2>/dev/null)
+        fi
+    fi
+    [ "$rc" -ne 0 ] && return 2
+    # Extract free KB: prefer line 2 field 4 (raw df table), fall back to a
+    # bare number (guest-side awk already reduced it). Never concatenate digits.
+    free_kb=$(printf '%s\n' "$out" | awk '
+        NR==1 { first=$0; n1=NF }
+        NR==2 && NF>=4 { print $4; found=1; exit }
+        END { if (!found) { if (n1==1) print first; else if (n1>=4) { split(first,f," "); print f[4] } } }' | tr -dc '0-9')
+    is_uint "$free_kb" || return 2
+    [ "$free_kb" -ge $((MIN_GUEST_FREE_MB * 1024)) ] && return 0
+    return 1
 }
 
 OK=0; FAIL=0; SKIP=0
@@ -230,6 +306,19 @@ fi
 total_count=$(printf '%s' "$resources" | jq 'length')
 node_guest_count=$(printf '%s' "$resources" | jq --arg node "$NODE" '[.[] | select(.node == $node)] | length')
 
+# ---- backup job list (FR-010, advisory) ----------------------------------
+BACKUP_STATUS="unknown"
+BACKUP_JOBS="[]"
+if [ "$BACKUP_CHECK" -eq 1 ]; then
+    if jobs_json=$(pvesh get /cluster/backup --output-format json 2>&1) \
+       && printf '%s' "$jobs_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+        BACKUP_STATUS="ok"
+        BACKUP_JOBS="$jobs_json"
+    else
+        log "⚠ backup status unknown: could not read /cluster/backup (FR-010)"
+    fi
+fi
+
 # ---- read-only modes: --list / --check (no lock, no changes) -------------
 if [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ]; then
     [ "$CHECK" -eq 1 ] && MODE=", check" || MODE=", list"
@@ -238,6 +327,7 @@ if [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ]; then
         log "⚠ no guests found on node $NODE (fetched $total_count total) - check PVE_NODE"
     fi
     declare -A ACTION_COUNT=()
+    NOAGENT=0; NOTCOVERED=0
     while IFS= read -r VM; do
         VMID=$(printf '%s' "$VM" | jq -r '.vmid')
         TYPE=$(printf '%s' "$VM" | jq -r '.type')
@@ -246,6 +336,14 @@ if [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ]; then
         NAME=$(printf '%s' "$VM" | jq -r '.name // ""')
         ACTION=$(guest_action "$VMID" "$STATUS" "$TAGS")
         ACTION_COUNT[$ACTION]=$(( ${ACTION_COUNT[$ACTION]:-0} + 1 ))
+        if [ "$CHECK" -eq 1 ] && { [ "$ACTION" = "apt" ] || [ "$ACTION" = "yum" ]; }; then
+            if [ "$AGENT_CHECK" -eq 1 ] && [ "$TYPE" = "qemu" ] && ! guest_has_agent "$VMID"; then
+                NOAGENT=$((NOAGENT+1))
+            fi
+            if [ "$BACKUP_CHECK" -eq 1 ] && [ "$BACKUP_STATUS" = "ok" ] && ! backup_covers "$VMID"; then
+                NOTCOVERED=$((NOTCOVERED+1))
+            fi
+        fi
         if [ "$LIST" -eq 1 ]; then
             printf '%-8s %-5s %-8s %-24s %s\n' "$VMID" "$TYPE" "$STATUS" "${TAGS:--}" "$NAME [$ACTION]"
         fi
@@ -254,6 +352,8 @@ if [ "$LIST" -eq 1 ] || [ "$CHECK" -eq 1 ]; then
         for action in "${!ACTION_COUNT[@]}"; do
             log "  inventory: $action = ${ACTION_COUNT[$action]}"
         done
+        log "  update candidates without guest agent: $NOAGENT"
+        log "  update candidates not covered by an enabled backup job: $NOTCOVERED"
         log "preflight ok: root, binaries, env, inventory"
     fi
     exit "$EXIT_OK"
@@ -309,24 +409,44 @@ while IFS= read -r VM; do
         SKIP=$((SKIP+1)); continue
     fi
 
-    # yum checked before apt (same precedence as v1/v2)
+    # decide update command first (yum before apt, same precedence as v1/v2)
+    UPDATE_CMD=""; UPDATE_KIND=""
     if has_tag "$TAGS" "yum"; then
-        log "▶ Updating $VMID ($TYPE) [yum/dnf]"
-        if run_guest_cmd "$TYPE" "$VMID" "$YUM_CMD"; then
-            OK=$((OK+1))
-        else
-            FAIL=$((FAIL+1))
-        fi
+        UPDATE_CMD="$YUM_CMD"; UPDATE_KIND="yum/dnf"
     elif has_tag "$TAGS" "apt"; then
-        log "▶ Updating $VMID ($TYPE) [apt]"
-        if run_guest_cmd "$TYPE" "$VMID" "$APT_CMD"; then
-            OK=$((OK+1))
-        else
-            FAIL=$((FAIL+1))
-        fi
+        UPDATE_CMD="$APT_CMD"; UPDATE_KIND="apt"
     else
         log "⚠ Skipping $VMID ($TYPE) - no apt/yum/windows tag (tags: ${TAGS:-none})"
-        SKIP=$((SKIP+1))
+        SKIP=$((SKIP+1)); continue
+    fi
+
+    # ---- B5 safety preflight per update candidate ------------------------
+    if [ "$AGENT_CHECK" -eq 1 ] && [ "$TYPE" = "qemu" ] && ! guest_has_agent "$VMID"; then
+        log "⏭ Skipping $VMID (qemu) - no guest agent (install qemu-guest-agent in the guest and run: qm set $VMID -agent enabled=1)"
+        SKIP=$((SKIP+1)); continue
+    fi
+
+    if [ "$DISK_CHECK" -eq 1 ] && [ "$DRY_RUN" -ne 1 ]; then
+        drc=0
+        check_guest_disk "$TYPE" "$VMID" || drc=$?
+        if [ "$drc" -eq 1 ]; then
+            log "⏭ Skipping $VMID ($TYPE) - insufficient disk space (<${MIN_GUEST_FREE_MB} MB free on /)"
+            SKIP=$((SKIP+1)); continue
+        elif [ "$drc" -eq 2 ]; then
+            log "⏭ Skipping $VMID ($TYPE) - disk space check failed (unknown prerequisites, SEC-009)"
+            SKIP=$((SKIP+1)); continue
+        fi
+    fi
+
+    if [ "$BACKUP_CHECK" -eq 1 ] && [ "$BACKUP_STATUS" = "ok" ] && ! backup_covers "$VMID"; then
+        log "⚠ $VMID ($TYPE): not covered by any enabled backup job (FR-010)"
+    fi
+
+    log "▶ Updating $VMID ($TYPE) [$UPDATE_KIND]"
+    if run_guest_cmd "$TYPE" "$VMID" "$UPDATE_CMD"; then
+        OK=$((OK+1))
+    else
+        FAIL=$((FAIL+1))
     fi
 done < <(printf '%s' "$resources" | jq -c --arg node "$NODE" '.[] | select(.node == $node)')
 

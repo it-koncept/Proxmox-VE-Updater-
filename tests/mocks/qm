@@ -1,10 +1,19 @@
 #!/bin/bash
 # Mock qm for tests. Logs every call to $MOCK_CALLS.
-# MOCK_QM_AGENT_DOWN_VMS: comma-separated VMIDs that fail with agent error.
+# df -P calls (disk preflight): JSON with out-data, free KB from MOCK_GUEST_DF.
+# MOCK_QM_AGENT_DOWN_VMS: vmids failing with agent error (exec + agent path).
 # MOCK_QM_RC: guest command exitcode embedded in the returned JSON.
 echo "qm $*" >> "$MOCK_CALLS"
 if [ "${1:-}" = "guest" ] && [ "${2:-}" = "exec" ]; then
     vmid="${3:-}"
+    if printf '%s' "$*" | grep -q "df -P"; then
+        if printf '%s' ",${MOCK_GUEST_DF_FAIL_VMS:-}," | grep -q ",$vmid,"; then
+            printf '{"exitcode": 1, "out-data": "df: no such file (mock)"}\n'
+        else
+            printf '{"exitcode": 0, "out-data": "Filesystem 1024-blocks Used Available Capacity Mounted\\n/dev/sda1 1000000 100 %s 91%% /\\n"}\n' "${MOCK_GUEST_DF:-50000000}"
+        fi
+        exit 0
+    fi
     if printf '%s' ",${MOCK_QM_AGENT_DOWN_VMS:-}," | grep -q ",$vmid,"; then
         echo "QEMU guest agent is not running" >&2
         exit 1
